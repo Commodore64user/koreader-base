@@ -29,73 +29,67 @@
 
 local max, min = math.max, math.min
 local floor, abs = math.floor, math.abs
-local byte, sub, rep = string.byte, string.sub, string.rep
-local match, format = string.match, string.format
+local byte, sub = string.byte, string.sub
+local match = string.match
 
 local bit = require("bit")
-local band, bor, bxor, lshift, rshift = bit.band, bit.bor, bit.bxor, bit.lshift, bit.rshift
+local band, bor, bxor, lshift, rshift, bnot = bit.band, bit.bor, bit.bxor, bit.lshift, bit.rshift, bit.bnot
+local ffi = require("ffi")
 
 --- Helper functions & Persistent Module Caches
 --- =========================================
 
--- Module-level scratchpads pre-allocated to Version 40 maximum bounds.
--- WARNING: Reusing these tables makes the qrcode() function non-reentrant.
--- It is safe for KOReader's single-threaded event loop, but must never be
--- invoked concurrently (e.g., via interleaved coroutines).
+-- FFI-backed persistent caches for maximum L1 cache density.
 local MAX_QR_LEN = 31329
-local base_matrix = {}
-local best_matrix = {}
-local scratch = {}
-local free_idx = {}
-local x_coords = {}
-local y_coords = {}
-local raw_bit = {}
+local MAX_STRIDE = floor((177 + 31) / 32)
+local MAX_BB_LEN = 177 * MAX_STRIDE
 
-for i = 1, MAX_QR_LEN do
-	base_matrix[i] = 0
-	best_matrix[i] = 0
-	scratch[i] = 0
-	free_idx[i] = 0
-	x_coords[i] = 0
-	y_coords[i] = 0
-	raw_bit[i] = 0
+-- Standard int8_t UI arrays
+local base_matrix = ffi.new("int8_t[?]", MAX_QR_LEN + 1)
+local best_matrix = ffi.new("int8_t[?]", MAX_QR_LEN + 1)
+local raw_bit     = ffi.new("int8_t[?]", MAX_QR_LEN + 1)
+
+local free_idx    = ffi.new("int32_t[?]", MAX_QR_LEN + 1)
+local x_coords    = ffi.new("int16_t[?]", MAX_QR_LEN + 1)
+local y_coords    = ffi.new("int16_t[?]", MAX_QR_LEN + 1)
+
+-- uint32_t Bitboards for the Penalty Pipeline
+local bb_base    = ffi.new("uint32_t[?]", MAX_BB_LEN)
+local bb_scratch = ffi.new("uint32_t[?]", MAX_BB_LEN)
+local bb_t       = ffi.new("uint32_t[?]", MAX_BB_LEN)
+local bb_masks   = {}
+for i = 0, 7 do
+	bb_masks[i] = ffi.new("uint32_t[?]", MAX_BB_LEN)
 end
 
--- Persistent encoding and EC block caches (Version 40 max capacity ~3706 bytes)
-local bw_buf = {}
-local arranged_data = {}
-local ec_blocks_cache = {}
-local mp_int = {}
-local block_data_offsets = {}
-local block_data_lens = {}
-local block_ec_offsets = {}
-local block_ec_lens = {}
-
-for i = 1, 4000 do
-	bw_buf[i] = 0
-	arranged_data[i] = 0
-	ec_blocks_cache[i] = 0
-end
-for i = 0, 255 do
-	mp_int[i] = 0
-end
-for i = 1, 200 do
-	block_data_offsets[i] = 0
-	block_data_lens[i] = 0
-	block_ec_offsets[i] = 0
-	block_ec_lens[i] = 0
-end
+-- Encoding and EC block caches
+local bw_buf             = ffi.new("uint8_t[?]", 4001)
+local arranged_data      = ffi.new("uint8_t[?]", 4001)
+local ec_blocks_cache    = ffi.new("uint8_t[?]", 4001)
+local mp_int             = ffi.new("int32_t[?]", 256)
+local block_data_offsets = ffi.new("int32_t[?]", 201)
+local block_data_lens    = ffi.new("int32_t[?]", 201)
+local block_ec_offsets   = ffi.new("int32_t[?]", 201)
+local block_ec_lens      = ffi.new("int32_t[?]", 201)
 
 local function set_cell(matrix, size, x, y, val)
 	matrix[(y - 1) * size + x] = val
 end
 
+local function set_bb_bit(bb, stride, x, y, val)
+	x, y = x - 1, y - 1
+	local w = y * stride + floor(x / 32)
+	if val == 1 then
+		bb[w] = bor(bb[w], lshift(1, x % 32))
+	else
+		bb[w] = band(bb[w], bnot(lshift(1, x % 32)))
+	end
+end
+
 -- Persistent BitWriter
 local bw = { buf = bw_buf, len = 0, acc = 0, bits = 0 }
 function bw:reset()
-	self.len = 0
-	self.acc = 0
-	self.bits = 0
+	self.len, self.acc, self.bits = 0, 0, 0
 end
 
 function bw:write(val, len)
@@ -467,6 +461,33 @@ local typeinfo = {
 	{ [0] = "001011010001001", "001001110111110", "001110011100111", "001100111010000", "000011101100010", "000001001010101", "000110100001100", "000100000111011" }
 }
 
+local function add_typeinfo_to_bb(bb, size, stride, ec_level, mask)
+	local ec_mask_type = typeinfo[ec_level][mask]
+	local bit_val
+	for i = 1, 7 do
+		bit_val = sub(ec_mask_type, i, i) == "1" and 1 or 0
+		set_bb_bit(bb, stride, 9, size - i + 1, bit_val)
+	end
+	for i = 8, 9 do
+		bit_val = sub(ec_mask_type, i, i) == "1" and 1 or 0
+		set_bb_bit(bb, stride, 9, 17 - i, bit_val)
+	end
+	for i = 10, 15 do
+		bit_val = sub(ec_mask_type, i, i) == "1" and 1 or 0
+		set_bb_bit(bb, stride, 9, 16 - i, bit_val)
+	end
+	for i = 1, 6 do
+		bit_val = sub(ec_mask_type, i, i) == "1" and 1 or 0
+		set_bb_bit(bb, stride, i, 9, bit_val)
+	end
+	bit_val = sub(ec_mask_type, 7, 7) == "1" and 1 or 0
+	set_bb_bit(bb, stride, 8, 9, bit_val)
+	for i = 8, 15 do
+		bit_val = sub(ec_mask_type, i, i) == "1" and 1 or 0
+		set_bb_bit(bb, stride, size - 15 + i, 9, bit_val)
+	end
+end
+
 local function add_typeinfo_to_matrix(matrix, size, ec_level, mask)
 	local ec_mask_type = typeinfo[ec_level][mask]
 	local bit_val
@@ -530,9 +551,7 @@ local function generate_base_matrix(version)
 	local size = version * 4 + 17
 	local len = size * size
 
-	for i = 1, len do
-		base_matrix[i] = 0
-	end
+	ffi.fill(base_matrix, len + 1, 0)
 
 	for i = 1, 8 do
 		for j = 1, 8 do
@@ -595,99 +614,85 @@ local maskFunc = {
 	function(x,y) return ((y*x)%3+y+x)%2==0 end,
 }
 
-local function calculate_penalty(matrix, size)
-	local penalty1, penalty2, penalty3 = 0, 0, 0
-	local number_of_dark_cells = 0
+local function calculate_penalty_bb(bb, size, stride, t_bb)
+	local p1, p2, p3 = 0, 0, 0
+	local dark_cells = 0
+	ffi.fill(t_bb, size * stride * 4, 0)
 
-	-- 1. Horizontal runs & Dark Cells (bounds: 1 to size)
-	local row_offset = 0
-	for y = 1, size do
-		local consec_h = 0
-		local last_c_h = nil
-		for x = 1, size do
-			local c = matrix[row_offset + x] > 0
-			if c then number_of_dark_cells = number_of_dark_cells + 1 end
+	-- Horizontal P1, P2, P3, and Transpose
+	for y = 0, size - 1 do
+		local offset = y * stride
+		local offset_next = (y + 1) * stride
+		local consec = 0
+		local last_b = -1
+		local window = 0
+		for x = 0, size - 1 do
+			local word_idx = floor(x / 32)
+			local bit_offset = x % 32
+			local b = band(rshift(bb[offset + word_idx], bit_offset), 1)
 
-			if c == last_c_h then
-				consec_h = consec_h + 1
+			if b == 1 then
+				dark_cells = dark_cells + 1
+				local t_w = x * stride + floor(y / 32)
+				t_bb[t_w] = bor(t_bb[t_w], lshift(1, y % 32))
+			end
+
+			if b == last_b then consec = consec + 1
 			else
-				if consec_h >= 5 then penalty1 = penalty1 + consec_h - 2 end
-				consec_h = 1
-				last_c_h = c
+				if consec >= 5 then p1 = p1 + consec - 2 end
+				consec = 1
+				last_b = b
 			end
-		end
-		if consec_h >= 5 then penalty1 = penalty1 + consec_h - 2 end
-		row_offset = row_offset + size
-	end
 
-	-- 2. Vertical runs (bounds: 1 to size)
-	for x = 1, size do
-		local consec_v = 0
-		local last_c_v = nil
-		local idx = x
-		for y = 1, size do
-			local c = matrix[idx] > 0
-			if c == last_c_v then
-				consec_v = consec_v + 1
-			else
-				if consec_v >= 5 then penalty1 = penalty1 + consec_v - 2 end
-				consec_v = 1
-				last_c_v = c
+			window = band(bor(lshift(window, 1), b), 0x7FF)
+			if x >= 10 then
+				if window == 0x05D or window == 0x5D0 then
+					p3 = p3 + 40
+				end
 			end
-			idx = idx + size
-		end
-		if consec_v >= 5 then penalty1 = penalty1 + consec_v - 2 end
-	end
 
-	-- 3. 2x2 Blocks (bounds: 1 to size - 1)
-	row_offset = 0
-	for y = 1, size - 1 do
-		for x = 1, size - 1 do
-			local idx = row_offset + x
-			local c1 = matrix[idx] > 0
-			if c1 == (matrix[idx + 1] > 0) and c1 == (matrix[idx + size] > 0) and c1 == (matrix[idx + size + 1] > 0) then
-				penalty2 = penalty2 + 3
-			end
-		end
-		row_offset = row_offset + size
-	end
-
-	-- 4. 1:1:3:1:1 Pattern Horizontal (bounds: 1 to size - 6)
-	row_offset = 0
-	for y = 1, size do
-		for x = 1, size - 6 do
-			local idx = row_offset + x
-			if matrix[idx] > 0 and matrix[idx+1] < 0 and matrix[idx+2] > 0 and matrix[idx+3] > 0 and matrix[idx+4] > 0 and matrix[idx+5] < 0 and matrix[idx+6] > 0 then
-				if (x + 10 <= size and matrix[idx+7] < 0 and matrix[idx+8] < 0 and matrix[idx+9] < 0 and matrix[idx+10] < 0) or
-				   (x >= 5 and matrix[idx-1] < 0 and matrix[idx-2] < 0 and matrix[idx-3] < 0 and matrix[idx-4] < 0) then
-					penalty3 = penalty3 + 40
+			if y < size - 1 and x < size - 1 then
+				local word_idx_rx = floor((x+1) / 32)
+				local bit_offset_rx = (x+1) % 32
+				local b_right = band(rshift(bb[offset + word_idx_rx], bit_offset_rx), 1)
+				local b_down = band(rshift(bb[offset_next + word_idx], bit_offset), 1)
+				local b_down_right = band(rshift(bb[offset_next + word_idx_rx], bit_offset_rx), 1)
+				if b == b_right and b == b_down and b == b_down_right then
+					p2 = p2 + 3
 				end
 			end
 		end
-		row_offset = row_offset + size
+		if consec >= 5 then p1 = p1 + consec - 2 end
 	end
 
-	-- 5. 1:1:3:1:1 Pattern Vertical (bounds: 1 to size - 6)
-	for x = 1, size do
-		local idx = x
-		for y = 1, size - 6 do
-			if matrix[idx] > 0 and matrix[idx+size] < 0 and matrix[idx+size*2] > 0 and matrix[idx+size*3] > 0 and matrix[idx+size*4] > 0 and matrix[idx+size*5] < 0 and matrix[idx+size*6] > 0 then
-				if (y + 10 <= size and matrix[idx+size*7] < 0 and matrix[idx+size*8] < 0 and matrix[idx+size*9] < 0 and matrix[idx+size*10] < 0) or
-				   (y >= 5 and matrix[idx-size] < 0 and matrix[idx-size*2] < 0 and matrix[idx-size*3] < 0 and matrix[idx-size*4] < 0) then
-					penalty3 = penalty3 + 40
+	-- Vertical P1 & P3
+	for y = 0, size - 1 do
+		local offset = y * stride
+		local consec = 0
+		local last_b = -1
+		local window = 0
+		for x = 0, size - 1 do
+			local b = band(rshift(t_bb[offset + floor(x / 32)], x % 32), 1)
+			if b == last_b then consec = consec + 1
+			else
+				if consec >= 5 then p1 = p1 + consec - 2 end
+				consec = 1
+				last_b = b
+			end
+			window = band(bor(lshift(window, 1), b), 0x7FF)
+			if x >= 10 then
+				if window == 0x05D or window == 0x5D0 then
+					p3 = p3 + 40
 				end
 			end
-			idx = idx + size
 		end
+		if consec >= 5 then p1 = p1 + consec - 2 end
 	end
 
-	-- Penalty 4: Dark/Light ratio
-	local dark_ratio = number_of_dark_cells / (size * size)
-	local penalty4 = floor(abs(dark_ratio * 100 - 50)) * 2
-
-	return penalty1 + penalty2 + penalty3 + penalty4
+	local dark_ratio = dark_cells / (size * size)
+	local p4 = floor(abs(dark_ratio * 100 - 50)) * 2
+	return p1 + p2 + p3 + p4
 end
-
 
 local function qrcode(str, ec_level, mode_enc)
 	local mode_num = mode_enc or get_mode(str)
@@ -702,13 +707,12 @@ local function qrcode(str, ec_level, mode_enc)
 	local total_arranged_bytes = arrange_codewords_and_calculate_ec(version, ec, bw.buf)
 	local size = generate_base_matrix(version)
 
-	-- Reserve typeinfo cells so they are not treated as free data cells
-	add_typeinfo_to_matrix(base_matrix, size, ec, 0)
-
 	local len = size * size
-	for i = 1, len do
-		scratch[i] = base_matrix[i]
-	end
+	local stride = floor((size + 31) / 32)
+	local total_words = size * stride
+
+	ffi.fill(bb_base, total_words * 4, 0)
+	for m = 0, 7 do ffi.fill(bb_masks[m], total_words * 4, 0) end
 
 	local free_count = 0
 	local bit_idx = 0
@@ -748,29 +752,43 @@ local function qrcode(str, ec_level, mode_enc)
 		x_dir = -x_dir
 	end
 
+	-- Populate bb_base with raw bits and fixed pixels
+	for yi = 1, size do
+		for xi = 1, size do
+			local v = base_matrix[(yi - 1) * size + xi]
+			if v == 2 or v == 1 then set_bb_bit(bb_base, stride, xi, yi, 1) end
+		end
+	end
+	for k = 1, free_count do
+		if raw_bit[k] == 1 then set_bb_bit(bb_base, stride, x_coords[k] + 1, y_coords[k] + 1, 1) end
+	end
+
+	-- Populate bb_masks only on free cells
+	for m = 0, 7 do
+		local func = maskFunc[m]
+		for k = 1, free_count do
+			if func(x_coords[k], y_coords[k]) then
+				set_bb_bit(bb_masks[m], stride, x_coords[k] + 1, y_coords[k] + 1, 1)
+			end
+		end
+	end
+
 	local min_penalty = nil
 	local best_mask = 0
 
 	for mask = 0, 7 do
-		add_typeinfo_to_matrix(scratch, size, ec, mask)
+		-- Apply Mask instantly
+		for i = 0, total_words - 1 do bb_scratch[i] = bxor(bb_base[i], bb_masks[mask][i]) end
+		add_typeinfo_to_bb(bb_scratch, size, stride, ec, mask)
 
-		local func = maskFunc[mask]
-		for k = 1, free_count do
-			local invert = func(x_coords[k], y_coords[k])
-			local data_bit = raw_bit[k]
-			if invert then data_bit = bxor(data_bit, 1) end
-			scratch[free_idx[k]] = data_bit == 1 and 1 or -1
-		end
-
-		local penalty = calculate_penalty(scratch, size)
+		local penalty = calculate_penalty_bb(bb_scratch, size, stride, bb_t)
 		if not min_penalty or penalty < min_penalty then
 			min_penalty = penalty
 			best_mask = mask
 		end
 	end
 
-	-- Build the final matrix exactly once
-	for i = 1, len do best_matrix[i] = base_matrix[i] end
+	ffi.copy(best_matrix, base_matrix, len + 1)
 	add_typeinfo_to_matrix(best_matrix, size, ec, best_mask)
 
 	local func = maskFunc[best_mask]
