@@ -35,21 +35,70 @@ local match, format = string.match, string.format
 local bit = require("bit")
 local band, bor, bxor, lshift, rshift = bit.band, bit.bor, bit.bxor, bit.lshift, bit.rshift
 
---- Helper functions
---- ================
+--- Helper functions & Persistent Module Caches
+--- =========================================
+
+-- Module-level scratchpads pre-allocated to Version 40 maximum bounds.
+-- WARNING: Reusing these tables makes the qrcode() function non-reentrant.
+-- It is safe for KOReader's single-threaded event loop, but must never be
+-- invoked concurrently (e.g., via interleaved coroutines).
+local MAX_QR_LEN = 31329
+local base_matrix = {}
+local best_matrix = {}
+local scratch = {}
+local free_idx = {}
+local x_coords = {}
+local y_coords = {}
+local raw_bit = {}
+
+for i = 1, MAX_QR_LEN do
+	base_matrix[i] = 0
+	best_matrix[i] = 0
+	scratch[i] = 0
+	free_idx[i] = 0
+	x_coords[i] = 0
+	y_coords[i] = 0
+	raw_bit[i] = 0
+end
+
+-- Persistent encoding and EC block caches (Version 40 max capacity ~3706 bytes)
+local bw_buf = {}
+local arranged_data = {}
+local ec_blocks_cache = {}
+local mp_int = {}
+local block_data_offsets = {}
+local block_data_lens = {}
+local block_ec_offsets = {}
+local block_ec_lens = {}
+
+for i = 1, 4000 do
+	bw_buf[i] = 0
+	arranged_data[i] = 0
+	ec_blocks_cache[i] = 0
+end
+for i = 0, 255 do
+	mp_int[i] = 0
+end
+for i = 1, 200 do
+	block_data_offsets[i] = 0
+	block_data_lens[i] = 0
+	block_ec_offsets[i] = 0
+	block_ec_lens[i] = 0
+end
 
 local function set_cell(matrix, size, x, y, val)
 	matrix[(y - 1) * size + x] = val
 end
 
--- BitWriter for memory-efficient data buffering
-local BitWriter = {}
-BitWriter.__index = BitWriter
-function BitWriter.new()
-	return setmetatable({ buf = {}, len = 0, acc = 0, bits = 0 }, BitWriter)
+-- Persistent BitWriter
+local bw = { buf = bw_buf, len = 0, acc = 0, bits = 0 }
+function bw:reset()
+	self.len = 0
+	self.acc = 0
+	self.bits = 0
 end
 
-function BitWriter:write(val, len)
+function bw:write(val, len)
 	self.acc = bor(lshift(self.acc, len), val)
 	self.bits = self.bits + len
 	while self.bits >= 8 do
@@ -59,13 +108,12 @@ function BitWriter:write(val, len)
 	end
 end
 
-function BitWriter:flush()
+function bw:flush()
 	if self.bits > 0 then
 		self.len = self.len + 1
 		self.buf[self.len] = band(lshift(self.acc, 8 - self.bits), 0xFF)
 		self.bits = 0
 	end
-	return self.buf
 end
 
 
@@ -130,7 +178,7 @@ local function get_version_eclevel(len,mode,requested_ec_level)
 	return minversion, maxec_level
 end
 
-local function write_length(bw, str_len, version, mode)
+local function write_length(str_len, version, mode)
 	local i = mode
 	if mode == 4 then i = 3 elseif mode == 8 then i = 4 end
 	local tab = { {10,9,8,8},{12,11,16,10},{14,13,16,12} }
@@ -154,30 +202,47 @@ local asciitbl = {
 	25, 26, 27, 28, 29, 30, 31, 32, 33, 34, 35, -1, -1, -1, -1, -1,
 }
 
-local function encode_data(str, mode, bw)
+local function encode_data(str, mode)
+	local str_len = #str
 	if mode == 1 then
-		for i = 1, #str, 3 do
-			local a = sub(str, i, i+2)
-			bw:write(tonumber(a), #a * 3 + 1)
+		local i = 1
+		while i <= str_len do
+			local rem = str_len - i + 1
+			if rem >= 3 then
+				local v = (byte(str, i) - 48) * 100 + (byte(str, i+1) - 48) * 10 + (byte(str, i+2) - 48)
+				bw:write(v, 10)
+				i = i + 3
+			elseif rem == 2 then
+				local v = (byte(str, i) - 48) * 10 + (byte(str, i+1) - 48)
+				bw:write(v, 7)
+				i = i + 2
+			else
+				local v = byte(str, i) - 48
+				bw:write(v, 4)
+				i = i + 1
+			end
 		end
 	elseif mode == 2 then
-		for i = 1, #str, 2 do
-			local a = sub(str, i, i+1)
-			if #a == 2 then
-				local int = asciitbl[byte(sub(a, 1, 1))] * 45 + asciitbl[byte(sub(a, 2, 2))]
-				bw:write(int, 11)
+		local i = 1
+		while i <= str_len do
+			local rem = str_len - i + 1
+			if rem >= 2 then
+				local v = asciitbl[byte(str, i)] * 45 + asciitbl[byte(str, i+1)]
+				bw:write(v, 11)
+				i = i + 2
 			else
-				bw:write(asciitbl[byte(a)], 6)
+				bw:write(asciitbl[byte(str, i)], 6)
+				i = i + 1
 			end
 		end
 	elseif mode == 4 then
-		for i = 1, #str do
+		for i = 1, str_len do
 			bw:write(byte(str, i), 8)
 		end
 	end
 end
 
-local function add_pad_data(version, ec_level, bw)
+local function add_pad_data(version, ec_level)
 	local cpty = capacity[version][ec_level] * 8
 	local current_bits = bw.len * 8 + bw.bits
 	local count_to_pad = min(4, cpty - current_bits)
@@ -190,7 +255,6 @@ local function add_pad_data(version, ec_level, bw)
 		bw.len = bw.len + 1
 		bw.buf[bw.len] = i % 2 == 1 and 236 or 17
 	end
-	return bw.buf
 end
 
 
@@ -252,24 +316,10 @@ local generator_polynomial = {
 	[28] = {123,   9,  37, 242, 119, 212, 195,  42,  87, 245,  43,  21, 201, 232,  27, 205, 147, 195, 190, 110, 180, 108, 234, 224, 104, 200, 223, 168,   0},
 	[30] = {180, 192,  40, 238, 216, 251,  37, 156, 130, 224, 193, 226, 173,  42, 125, 222,  96, 239,  86, 110,  48,  50, 182, 179,  31, 216, 152, 145, 173, 41, 0}}
 
-local function get_generator_polynomial_adjusted(num_ec_codewords, highest_exponent)
-	local gp_alpha = {[0]=0}
-	for i = 0, highest_exponent - num_ec_codewords - 1 do
-		gp_alpha[i] = 0
-	end
-	local gp = generator_polynomial[num_ec_codewords]
-	for i = 1, num_ec_codewords + 1 do
-		gp_alpha[highest_exponent - num_ec_codewords + i - 1] = gp[i]
-	end
-	return gp_alpha
-end
-
-local function calculate_error_correction(mp, num_ec_codewords)
-	local len_message = #mp
+local function calculate_error_correction(data, data_offset, len_message, num_ec_codewords, out_array, out_offset)
 	local highest_exponent = len_message + num_ec_codewords - 1
-	local mp_int = {}
 	for i = 1, len_message do
-		mp_int[highest_exponent - i + 1] = mp[i]
+		mp_int[highest_exponent - i + 1] = data[data_offset + i - 1]
 	end
 	for i = 1, highest_exponent - len_message do
 		mp_int[i] = 0
@@ -293,11 +343,10 @@ local function calculate_error_correction(mp, num_ec_codewords)
 		end
 		if highest_exponent < num_ec_codewords then break end
 	end
-	local ret = {}
-	for i = highest_exponent, 0, -1 do
-		ret[#ret + 1] = mp_int[i]
+
+	for i = 1, num_ec_codewords do
+		out_array[out_offset + i - 1] = mp_int[num_ec_codewords - i]
 	end
-	return ret
 end
 
 local ecblocks = {
@@ -345,40 +394,57 @@ local ecblocks = {
 
 local function arrange_codewords_and_calculate_ec(version, ec_level, data)
 	local blocks = ecblocks[version][ec_level]
-	local size_datablock_bytes, size_ecblock_bytes
-	local datablocks = {}
-	local final_ecblocks = {}
-	local pos = 1
+	local num_blocks = 0
+	local data_pos = 1
+	local ec_pos = 1
+	local max_data_len = 0
+	local max_ec_len = 0
+
+	local block_idx = 1
 	for i = 1, #blocks / 2 do
-		size_datablock_bytes = blocks[2*i][2]
-		size_ecblock_bytes   = blocks[2*i][1] - size_datablock_bytes
-		for _ = 1, blocks[2*i - 1] do
-			local current_block = {}
-			for j = 1, size_datablock_bytes do
-				current_block[j] = data[pos]
-				pos = pos + 1
+		local count = blocks[2*i - 1]
+		local size_datablock = blocks[2*i][2]
+		local size_ecblock = blocks[2*i][1] - size_datablock
+
+		max_data_len = max(max_data_len, size_datablock)
+		max_ec_len = max(max_ec_len, size_ecblock)
+
+		for _ = 1, count do
+			block_data_offsets[block_idx] = data_pos
+			block_data_lens[block_idx] = size_datablock
+
+			block_ec_offsets[block_idx] = ec_pos
+			block_ec_lens[block_idx] = size_ecblock
+
+			calculate_error_correction(data, data_pos, size_datablock, size_ecblock, ec_blocks_cache, ec_pos)
+
+			data_pos = data_pos + size_datablock
+			ec_pos = ec_pos + size_ecblock
+			block_idx = block_idx + 1
+		end
+	end
+	num_blocks = block_idx - 1
+
+	local out_len = 0
+	for p = 1, max_data_len do
+		for b = 1, num_blocks do
+			if p <= block_data_lens[b] then
+				out_len = out_len + 1
+				arranged_data[out_len] = data[block_data_offsets[b] + p - 1]
 			end
-			datablocks[#datablocks + 1] = current_block
-			final_ecblocks[#final_ecblocks + 1] = calculate_error_correction(current_block, size_ecblock_bytes)
 		end
 	end
 
-	local arranged_data = {}
-	local maxBlockLen = 0
-	for i = 1, #datablocks do maxBlockLen = max(maxBlockLen, #datablocks[i]) end
-	for p = 1, maxBlockLen do
-		for i = 1, #datablocks do
-			if p <= #datablocks[i] then arranged_data[#arranged_data + 1] = datablocks[i][p] end
+	for p = 1, max_ec_len do
+		for b = 1, num_blocks do
+			if p <= block_ec_lens[b] then
+				out_len = out_len + 1
+				arranged_data[out_len] = ec_blocks_cache[block_ec_offsets[b] + p - 1]
+			end
 		end
 	end
-	maxBlockLen = 0
-	for i = 1, #final_ecblocks do maxBlockLen = max(maxBlockLen, #final_ecblocks[i]) end
-	for p = 1, maxBlockLen do
-		for i = 1, #final_ecblocks do
-			if p <= #final_ecblocks[i] then arranged_data[#arranged_data + 1] = final_ecblocks[i][p] end
-		end
-	end
-	return arranged_data
+
+	return out_len
 end
 
 
@@ -458,6 +524,64 @@ local function add_version_information(matrix, version, size)
 		y = start_y + (i - 1) % 3
 		set_cell(matrix, size, x, y, bit_val)
 	end
+end
+
+local function generate_base_matrix(version)
+	local size = version * 4 + 17
+	local len = size * size
+
+	for i = 1, len do
+		base_matrix[i] = 0
+	end
+
+	for i = 1, 8 do
+		for j = 1, 8 do
+			set_cell(base_matrix, size, i, j, -2)
+			set_cell(base_matrix, size, size - 8 + i, j, -2)
+			set_cell(base_matrix, size, i, size - 8 + j, -2)
+		end
+	end
+
+	for i = 1, 7 do
+		set_cell(base_matrix, size, 1, i, 2); set_cell(base_matrix, size, 7, i, 2)
+		set_cell(base_matrix, size, i, 1, 2); set_cell(base_matrix, size, i, 7, 2)
+		set_cell(base_matrix, size, size, i, 2); set_cell(base_matrix, size, size - 6, i, 2)
+		set_cell(base_matrix, size, size - i + 1, 1, 2); set_cell(base_matrix, size, size - i + 1, 7, 2)
+		set_cell(base_matrix, size, 1, size - i + 1, 2); set_cell(base_matrix, size, 7, size - i + 1, 2)
+		set_cell(base_matrix, size, i, size - 6, 2); set_cell(base_matrix, size, i, size, 2)
+	end
+
+	for i = 1, 3 do
+		for j = 1, 3 do
+			set_cell(base_matrix, size, 2 + j, i + 2, 2)
+			set_cell(base_matrix, size, size - j - 1, i + 2, 2)
+			set_cell(base_matrix, size, 2 + j, size - i - 1, 2)
+		end
+	end
+
+	for i = 9, size - 8 do
+		set_cell(base_matrix, size, i, 7, i % 2 == 0 and -2 or 2)
+		set_cell(base_matrix, size, 7, i, i % 2 == 0 and -2 or 2)
+	end
+
+	add_version_information(base_matrix, version, size)
+	set_cell(base_matrix, size, 9, size - 7, 2)
+
+	local ap = alignment_pattern[version]
+	for x = 1, #ap do
+		for y = 1, #ap do
+			if not (x == 1 and y == 1 or x == #ap and y == 1 or x == 1 and y == #ap) then
+				local pos_x, pos_y = ap[x] + 1, ap[y] + 1
+				for dy = -2, 2 do
+					for dx = -2, 2 do
+						set_cell(base_matrix, size, pos_x + dx, pos_y + dy, max(abs(dx), abs(dy)) % 2 == 0 and 2 or -2)
+					end
+				end
+			end
+		end
+	end
+
+	return size
 end
 
 local maskFunc = {
@@ -564,96 +688,18 @@ local function calculate_penalty(matrix, size)
 	return penalty1 + penalty2 + penalty3 + penalty4
 end
 
--- Module-level scratchpads pre-allocated to Version 40 maximum size (177 * 177)
--- WARNING: Reusing these tables makes the qrcode() function non-reentrant.
--- It is safe for KOReader's single-threaded event loop, but must never be
--- invoked concurrently (e.g., via interleaved coroutines).
-local MAX_QR_LEN = 31329
-local base_matrix = {}
-local best_matrix = {}
-local scratch = {}
-local free_idx = {}
-local x_coords = {}
-local y_coords = {}
-local raw_bit = {}
-
-for i = 1, MAX_QR_LEN do
-	base_matrix[i] = 0
-	best_matrix[i] = 0
-	scratch[i] = 0
-	free_idx[i] = 0
-	x_coords[i] = 0
-	y_coords[i] = 0
-	raw_bit[i] = 0
-end
-
-local function generate_base_matrix(version)
-	local size = version * 4 + 17
-	local len = size * size
-
-	for i = 1, len do
-		base_matrix[i] = 0
-	end
-
-	for i = 1, 8 do
-		for j = 1, 8 do
-			set_cell(base_matrix, size, i, j, -2)
-			set_cell(base_matrix, size, size - 8 + i, j, -2)
-			set_cell(base_matrix, size, i, size - 8 + j, -2)
-		end
-	end
-
-	for i = 1, 7 do
-		set_cell(base_matrix, size, 1, i, 2); set_cell(base_matrix, size, 7, i, 2)
-		set_cell(base_matrix, size, i, 1, 2); set_cell(base_matrix, size, i, 7, 2)
-		set_cell(base_matrix, size, size, i, 2); set_cell(base_matrix, size, size - 6, i, 2)
-		set_cell(base_matrix, size, size - i + 1, 1, 2); set_cell(base_matrix, size, size - i + 1, 7, 2)
-		set_cell(base_matrix, size, 1, size - i + 1, 2); set_cell(base_matrix, size, 7, size - i + 1, 2)
-		set_cell(base_matrix, size, i, size - 6, 2); set_cell(base_matrix, size, i, size, 2)
-	end
-
-	for i = 1, 3 do
-		for j = 1, 3 do
-			set_cell(base_matrix, size, 2 + j, i + 2, 2)
-			set_cell(base_matrix, size, size - j - 1, i + 2, 2)
-			set_cell(base_matrix, size, 2 + j, size - i - 1, 2)
-		end
-	end
-
-	for i = 9, size - 8 do
-		set_cell(base_matrix, size, i, 7, i % 2 == 0 and -2 or 2)
-		set_cell(base_matrix, size, 7, i, i % 2 == 0 and -2 or 2)
-	end
-
-	add_version_information(base_matrix, version, size)
-	set_cell(base_matrix, size, 9, size - 7, 2)
-
-	local ap = alignment_pattern[version]
-	for x = 1, #ap do
-		for y = 1, #ap do
-			if not (x == 1 and y == 1 or x == #ap and y == 1 or x == 1 and y == #ap) then
-				local pos_x, pos_y = ap[x] + 1, ap[y] + 1
-				for dy = -2, 2 do
-					for dx = -2, 2 do
-						set_cell(base_matrix, size, pos_x + dx, pos_y + dy, max(abs(dx), abs(dy)) % 2 == 0 and 2 or -2)
-					end
-				end
-			end
-		end
-	end
-
-	return size
-end
 
 local function qrcode(str, ec_level, mode_enc)
 	local mode_num = mode_enc or get_mode(str)
 	local version, ec = get_version_eclevel(#str, mode_num, ec_level)
-	local bw = BitWriter.new()
+
+	bw:reset()
 	bw:write(mode_num, 4)
-	write_length(bw, #str, version, mode_num)
-	encode_data(str, mode_num, bw)
-	local data_bytes = add_pad_data(version, ec, bw)
-	local arranged_data = arrange_codewords_and_calculate_ec(version, ec, data_bytes)
+	write_length(#str, version, mode_num)
+	encode_data(str, mode_num)
+	add_pad_data(version, ec)
+
+	local total_arranged_bytes = arrange_codewords_and_calculate_ec(version, ec, bw.buf)
 	local size = generate_base_matrix(version)
 
 	-- Reserve typeinfo cells so they are not treated as free data cells
@@ -666,7 +712,7 @@ local function qrcode(str, ec_level, mode_enc)
 
 	local free_count = 0
 	local bit_idx = 0
-	local total_bits = #arranged_data * 8
+	local total_bits = total_arranged_bytes * 8
 
 	local x, y = size, size
 	local x_dir, y_dir = -1, -1
