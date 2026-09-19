@@ -626,6 +626,7 @@ local function calculate_penalty_bb(bb, size, stride, t_bb)
 		local consec = 0
 		local last_b = -1
 		local window = 0
+		local last_p3 = -10
 		for x = 0, size - 1 do
 			local word_idx = floor(x / 32)
 			local bit_offset = x % 32
@@ -646,7 +647,10 @@ local function calculate_penalty_bb(bb, size, stride, t_bb)
 
 			window = band(bor(lshift(window, 1), b), 0x7FF)
 			if x >= 10 then
-				if window == 0x05D or window == 0x5D0 then
+				if window == 0x05D then
+					p3 = p3 + 40
+					last_p3 = x
+				elseif window == 0x5D0 and last_p3 ~= x - 4 then
 					p3 = p3 + 40
 				end
 			end
@@ -671,6 +675,7 @@ local function calculate_penalty_bb(bb, size, stride, t_bb)
 		local consec = 0
 		local last_b = -1
 		local window = 0
+		local last_p3 = -10
 		for x = 0, size - 1 do
 			local b = band(rshift(t_bb[offset + floor(x / 32)], x % 32), 1)
 			if b == last_b then consec = consec + 1
@@ -679,9 +684,13 @@ local function calculate_penalty_bb(bb, size, stride, t_bb)
 				consec = 1
 				last_b = b
 			end
+
 			window = band(bor(lshift(window, 1), b), 0x7FF)
 			if x >= 10 then
-				if window == 0x05D or window == 0x5D0 then
+				if window == 0x05D then
+					p3 = p3 + 40
+					last_p3 = x
+				elseif window == 0x5D0 and last_p3 ~= x - 4 then
 					p3 = p3 + 40
 				end
 			end
@@ -706,6 +715,9 @@ local function qrcode(str, ec_level, mode_enc)
 
 	local total_arranged_bytes = arrange_codewords_and_calculate_ec(version, ec, bw.buf)
 	local size = generate_base_matrix(version)
+
+	-- BUG 1 FIX: Shield typeinfo cells from being treated as free data cells
+	add_typeinfo_to_matrix(base_matrix, size, ec, 0)
 
 	local len = size * size
 	local stride = floor((size + 31) / 32)
