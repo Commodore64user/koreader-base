@@ -41,8 +41,10 @@ local ffi = require("ffi")
 
 -- FFI-backed persistent caches for maximum L1 cache density.
 local MAX_QR_LEN = 31329
-local MAX_STRIDE = floor((177 + 31) / 32)
-local MAX_BB_LEN = 177 * MAX_STRIDE
+local MAX_PADDING = 4
+local MAX_PADDED_SIZE = 177 + 2 * MAX_PADDING
+local MAX_STRIDE = floor((MAX_PADDED_SIZE + 31) / 32)
+local MAX_BB_LEN = MAX_PADDED_SIZE * MAX_STRIDE
 
 -- Standard int8_t UI arrays
 local base_matrix = ffi.new("int8_t[?]", MAX_QR_LEN + 1)
@@ -594,30 +596,54 @@ local tr_buf    = ffi.new("uint32_t[?]", 32)
 
 local sz_cache = {}
 
--- Valid pattern-start positions p within word w (p + width <= size).
-local function start_mask(size, w, width)
-	local maxp = size - width - w * 32
-	if maxp < 0 then return 0 end
-	if maxp >= 31 then return -1 end
-	return lshift(1, maxp + 1) - 1
+local function make_mask(min_b, max_b)
+	local mask = 0
+	if min_b <= max_b then
+		min_b = max(0, min_b)
+		max_b = min(31, max_b)
+		for i = min_b, max_b do
+			mask = bor(mask, lshift(1, i))
+		end
+	end
+	return mask
 end
 
-local function get_size_masks(size, stride)
-	local e = sz_cache[size]
+local function get_size_masks(size, stride, padding)
+	local key = size * 100 + padding
+	local e = sz_cache[key]
 	if e then return e end
-	e = { v5 = {}, m3 = {}, m15 = {}, p2 = {} }
+	e = { v5 = {}, m3A = {}, m3B = {} }
+	local end_idx = padding + size - 1
 	for w = 0, stride - 1 do
-		e.v5[w]  = start_mask(size, w, 5)
-		e.m3[w]  = start_mask(size, w, 11)
-		e.m15[w] = start_mask(size, w, 15)
-		e.p2[w]  = band(start_mask(size, w, 2), 0x7FFFFFFF)
+		local w_off = w * 32
+		-- v5 (P1): Run of 5 must be entirely inside the symbol
+		e.v5[w] = make_mask(padding - w_off, end_idx - 4 - w_off)
+
+		-- m3A (P3 TA): 11-bit pattern 00001011101. 1s are at offsets +4 to +10.
+		-- The 1s must be inside, meaning start bit 'b' can overhang into the left padding by up to 4.
+		e.m3A[w] = make_mask(padding - 4 - w_off, end_idx - 10 - w_off)
+
+		-- m3B (P3 TB): 11-bit pattern 10111010000. 1s are at offsets +0 to +6.
+		e.m3B[w] = make_mask(padding - w_off, end_idx - 6 - w_off)
 	end
-	sz_cache[size] = e
+	sz_cache[key] = e
 	return e
 end
 
--- In-place 32x32 bit matrix transpose on tr_buf. Stage j swaps the j-th
--- coordinate bit between row and column index for every element.
+local p2_mask_cache = {}
+local function get_p2_masks(size, stride, padding)
+	local e = p2_mask_cache[size]
+	if e then return e end
+	e = {}
+	for w = 0, stride - 1 do
+		local start_bit = padding - w * 32
+		local end_bit = padding + size - 2 - w * 32
+		e[w] = make_mask(start_bit, end_bit)
+	end
+	p2_mask_cache[size] = e
+	return e
+end
+
 local function transpose32()
 	local a, b, t
 	for k = 0, 15 do
@@ -661,7 +687,6 @@ local function transpose32()
 	end
 end
 
--- Transpose a bitboard into dst (same y-major layout).
 local function transpose_bb(src, dst, size, stride)
 	for bx = 0, stride - 1 do
 		for by = 0, stride - 1 do
@@ -679,12 +704,12 @@ local function transpose_bb(src, dst, size, stride)
 	end
 end
 
--- P1 (runs >= 5) and P3 (finder-like patterns), one 32-bit word at a time.
-local function scan_p1p3(bb, size, stride, sm)
-	local v5, m3, m15 = sm.v5, sm.m3, sm.m15
+local function scan_p1p3(bb, size, stride, padding, sm)
+	local v5, m3A, m3B = sm.v5, sm.m3A, sm.m3B
 	local w_end = stride - 1
 	local p1, p3 = 0, 0
-	for y = 0, size - 1 do
+
+	for y = padding, padding + size - 1 do
 		local off = y * stride
 		local prev31 = 0
 		for w = 0, w_end do
@@ -696,6 +721,9 @@ local function scan_p1p3(bb, size, stride, sm)
 			end
 			prev31 = rshift(b, 31)
 		end
+
+		c_bb[off] = bor(c_bb[off], lshift(1, padding))
+
 		for w = 0, w_end do
 			local c = c_bb[off + w]
 			local z1 = bor(bor(rshift(c, 1), rshift(c, 2)), bor(rshift(c, 3), rshift(c, 4)))
@@ -719,64 +747,107 @@ local function scan_p1p3(bb, size, stride, sm)
 			local s8 = bor(rshift(b, 8), lshift(bnext, 24))
 			local s9 = bor(rshift(b, 9), lshift(bnext, 23))
 			local s10 = bor(rshift(b, 10), lshift(bnext, 22))
+
 			local TA = band(band(band(s4, s6), band(s7, s8)), s10)
 			local NA = bor(bor(bor(s0, s1), bor(s2, s3)), bor(s5, s9))
+
 			local TB = band(band(band(s0, s2), band(s3, s4)), s6)
 			local NB = bor(bor(bor(s1, s5), bor(s7, s8)), bor(s9, s10))
-			local m3w = m3[w]
-			p3 = p3 + 40 * popcount32(band(band(TA, bxor(NA, -1)), m3w))
-			p3 = p3 + 40 * popcount32(band(band(TB, bxor(NB, -1)), m3w))
+
+			p3 = p3 + 40 * popcount32(band(band(TA, bxor(NA, -1)), m3A[w]))
+			p3 = p3 + 40 * popcount32(band(band(TB, bxor(NB, -1)), m3B[w]))
+
 			local s11 = bor(rshift(b, 11), lshift(bnext, 21))
 			local s12 = bor(rshift(b, 12), lshift(bnext, 20))
 			local s13 = bor(rshift(b, 13), lshift(bnext, 19))
 			local s14 = bor(rshift(b, 14), lshift(bnext, 18))
 			local ND = bor(bor(NA, s11), bor(bor(s12, s13), s14))
-			p3 = p3 - 40 * popcount32(band(band(TA, bxor(ND, -1)), m15[w]))
+
+			p3 = p3 - 40 * popcount32(band(band(TA, bxor(ND, -1)), m3A[w]))
 		end
 	end
 	return p1, p3
 end
 
--- Typeinfo bits into a board and its transpose in one pass.
-local function add_typeinfo_both(bb, tbb, size, stride, ec_level, mask)
+local function compute_penalty_components(bb, tbb, padded_size, size, stride, padding)
+	local sm = get_size_masks(size, stride, padding)
+	local p1, p3 = scan_p1p3(bb, size, stride, padding, sm)
+	local p1v, p3v = scan_p1p3(tbb, size, stride, padding, sm)
+	p1 = p1 + p1v
+	p3 = p3 + p3v
+
+	local p2, dark = 0, 0
+	local w_end = stride - 1
+	local p2m = get_p2_masks(size, stride, padding)
+
+	for y = padding, padding + size - 1 do
+		local offA = y * stride
+		for w = 0, w_end do
+			dark = dark + popcount32(bb[offA + w])
+		end
+
+		if y < padding + size - 1 then
+			local offB = offA + stride
+			for w = 0, w_end do
+				local a = bb[offA + w]
+				local b2 = bb[offB + w]
+				local d = bor(bor(bxor(a, rshift(a, 1)), bxor(a, b2)), bxor(b2, rshift(b2, 1)))
+
+				p2 = p2 + popcount32(band(bnot(d), p2m[w])) * 3
+
+				local cross_bit = w * 32 + 31
+				if cross_bit >= padding and cross_bit <= padding + size - 2 then
+					local a31 = band(rshift(a, 31), 1)
+					local b31 = band(rshift(b2, 31), 1)
+					if a31 == b31 and a31 == band(bb[offA + w + 1], 1) and b31 == band(bb[offB + w + 1], 1) then
+						p2 = p2 + 3
+					end
+				end
+			end
+		end
+	end
+
+	local percent = dark / (size * size) * 100
+	local p4 = floor(abs(50 - percent) / 5) * 10
+	return p1, p2, p3, p4
+end
+
+local function add_typeinfo_both(bb, tbb, size, stride, ec_level, mask, padding)
 	local ec_mask_type = typeinfo[ec_level][mask]
 	local bit_val
 	for i = 1, 7 do
 		bit_val = sub(ec_mask_type, i, i) == "1" and 1 or 0
-		set_bb_bit(bb, stride, 9, size - i + 1, bit_val)
-		set_bb_bit(tbb, stride, size - i + 1, 9, bit_val)
+		set_bb_bit(bb, stride, padding + 9, padding + size - i + 1, bit_val)
+		set_bb_bit(tbb, stride, padding + size - i + 1, padding + 9, bit_val)
 	end
 	for i = 8, 9 do
 		bit_val = sub(ec_mask_type, i, i) == "1" and 1 or 0
-		set_bb_bit(bb, stride, 9, 17 - i, bit_val)
-		set_bb_bit(tbb, stride, 17 - i, 9, bit_val)
+		set_bb_bit(bb, stride, padding + 9, padding + 17 - i, bit_val)
+		set_bb_bit(tbb, stride, padding + 17 - i, padding + 9, bit_val)
 	end
 	for i = 10, 15 do
 		bit_val = sub(ec_mask_type, i, i) == "1" and 1 or 0
-		set_bb_bit(bb, stride, 9, 16 - i, bit_val)
-		set_bb_bit(tbb, stride, 16 - i, 9, bit_val)
+		set_bb_bit(bb, stride, padding + 9, padding + 16 - i, bit_val)
+		set_bb_bit(tbb, stride, padding + 16 - i, padding + 9, bit_val)
 	end
 	for i = 1, 6 do
 		bit_val = sub(ec_mask_type, i, i) == "1" and 1 or 0
-		set_bb_bit(bb, stride, i, 9, bit_val)
-		set_bb_bit(tbb, stride, 9, i, bit_val)
+		set_bb_bit(bb, stride, padding + i, padding + 9, bit_val)
+		set_bb_bit(tbb, stride, padding + 9, padding + i, bit_val)
 	end
 	bit_val = sub(ec_mask_type, 7, 7) == "1" and 1 or 0
-	set_bb_bit(bb, stride, 8, 9, bit_val)
-	set_bb_bit(tbb, stride, 9, 8, bit_val)
+	set_bb_bit(bb, stride, padding + 8, padding + 9, bit_val)
+	set_bb_bit(tbb, stride, padding + 9, padding + 8, bit_val)
 	for i = 8, 15 do
 		bit_val = sub(ec_mask_type, i, i) == "1" and 1 or 0
-		set_bb_bit(bb, stride, size - 15 + i, 9, bit_val)
-		set_bb_bit(tbb, stride, 9, size - 15 + i, bit_val)
+		set_bb_bit(bb, stride, padding + size - 15 + i, padding + 9, bit_val)
+		set_bb_bit(tbb, stride, padding + 9, padding + size - 15 + i, bit_val)
 	end
 end
 
--- Per-version static state: zigzag free-cell order, mask bitboards (and
--- their transposes), and per-EC fixed-dark bitboards.
 local static_cache = {}
 
-local function build_static(version, size, stride)
-	local total_words = size * stride
+local function build_static(version, size, stride, padding, total_words)
 	local n_cells = size * size
 	local entry = {
 		count = 0,
@@ -817,57 +888,19 @@ local function build_static(version, size, stride)
 		local mb = entry.masks[m]
 		for k = 1, count do
 			if func(entry.x[k], entry.y[k]) then
-				set_bb_bit(mb, stride, entry.x[k] + 1, entry.y[k] + 1, 1)
+				set_bb_bit(mb, stride, entry.x[k] + 1 + padding, entry.y[k] + 1 + padding, 1)
 			end
 		end
 	end
+	local padded_size = size + 2 * padding
 	for m = 0, 7 do
-		transpose_bb(entry.masks[m], T_base, size, stride)
+		transpose_bb(entry.masks[m], T_base, padded_size, stride)
 		local tb = ffi.new("uint32_t[?]", total_words)
 		ffi.copy(tb, T_base, total_words * 4)
 		entry.t_masks[m] = tb
 	end
 	static_cache[version] = entry
 	return entry
-end
-
--- Computes all four penalty components for a mask's board pair.
-local function compute_penalty_components(bb, tbb, size, stride)
-	local sm = get_size_masks(size, stride)
-	local p1, p3 = scan_p1p3(bb, size, stride, sm)
-	local p1v, p3v = scan_p1p3(tbb, size, stride, sm)
-	p1 = p1 + p1v
-	p3 = p3 + p3v
-
-	local p2, dark = 0, 0
-	local w_end = stride - 1
-	local p2m = sm.p2
-	for y = 0, size - 1 do
-		local offA = y * stride
-		for w = 0, w_end do
-			dark = dark + popcount32(bb[offA + w])
-		end
-		if y < size - 1 then
-			local offB = offA + stride
-			for w = 0, w_end do
-				local a = bb[offA + w]
-				local b2 = bb[offB + w]
-				local d = bor(bor(bxor(a, rshift(a, 1)), bxor(a, b2)), bxor(b2, rshift(b2, 1)))
-				p2 = p2 + popcount32(band(bnot(d), p2m[w])) * 3
-				if w * 32 + 31 <= size - 2 then
-					local a31 = rshift(a, 31)
-					local b31 = rshift(b2, 31)
-					if a31 == b31 and a31 == band(bb[offA + w + 1], 1) and b31 == band(bb[offB + w + 1], 1) then
-						p2 = p2 + 3
-					end
-				end
-			end
-		end
-	end
-
-	local percent = dark / (size * size) * 100
-	local p4 = floor(abs(50 - percent) / 5) * 10
-	return p1, p2, p3, p4
 end
 
 -- Shared setup: encodes `str`, builds the base (unmasked) bitboards, and
@@ -887,10 +920,12 @@ local function prepare_boards(str, ec_level, mode_enc)
 
 	add_typeinfo_to_matrix(base_matrix, size, ec, 0)
 
-	local stride = floor((size + 31) / 32)
-	local total_words = size * stride
+	local padding = 4
+	local padded_size = size + 2 * padding
+	local stride = floor((padded_size + 31) / 32)
+	local total_words = padded_size * stride
 
-	local entry = static_cache[version] or build_static(version, size, stride)
+	local entry = static_cache[version] or build_static(version, size, stride, padding, total_words)
 	local count = entry.count
 
 	local fixed_dark = entry.fixed[ec]
@@ -900,7 +935,7 @@ local function prepare_boards(str, ec_level, mode_enc)
 			local rowbase = (yi - 1) * size
 			for xi = 1, size do
 				if base_matrix[rowbase + xi] == 2 then
-					set_bb_bit(fixed_dark, stride, xi, yi, 1)
+					set_bb_bit(fixed_dark, stride, xi + padding, yi + padding, 1)
 				end
 			end
 		end
@@ -918,21 +953,18 @@ local function prepare_boards(str, ec_level, mode_enc)
 		end
 		raw_bit[k] = data_bit
 		if data_bit == 1 then
-			local xx, yy = entry.x[k], entry.y[k]
+			local xx, yy = entry.x[k] + padding, entry.y[k] + padding
 			local wi = yy * stride + floor(xx / 32)
 			bb_base[wi] = bor(bb_base[wi], lshift(1, xx % 32))
 		end
 	end
 
-	transpose_bb(bb_base, T_base, size, stride)
+	transpose_bb(bb_base, T_base, padded_size, stride)
 
-	return version, ec, size, stride, total_words, entry
+	return version, ec, size, padded_size, stride, total_words, entry, padding, total_arranged_bytes
 end
 
--- Shared mask search: scores all 8 masks and returns the winner plus
--- the full per-mask p1/p2/p3/p4 breakdown. qrcode() uses only
--- best_mask; debug_mask_penalties() uses both.
-local function search_masks(size, stride, total_words, ec, entry, is_debug)
+local function search_masks(size, padded_size, stride, total_words, ec, entry, padding, is_debug)
 	local components = is_debug and {} or nil
 	local min_penalty, best_mask = nil, 0
 	for mask = 0, 7 do
@@ -942,9 +974,9 @@ local function search_masks(size, stride, total_words, ec, entry, is_debug)
 			bb_scratch[i] = bxor(bb_base[i], mb[i])
 			T_scratch[i] = bxor(T_base[i], tb[i])
 		end
-		add_typeinfo_both(bb_scratch, T_scratch, size, stride, ec, mask)
+		add_typeinfo_both(bb_scratch, T_scratch, size, stride, ec, mask, padding)
 
-		local p1, p2, p3, p4 = compute_penalty_components(bb_scratch, T_scratch, size, stride)
+		local p1, p2, p3, p4 = compute_penalty_components(bb_scratch, T_scratch, padded_size, size, stride, padding)
 
 		if is_debug then
 			components[mask] = { p1 = p1, p2 = p2, p3 = p3, p4 = p4 }
@@ -960,8 +992,9 @@ local function search_masks(size, stride, total_words, ec, entry, is_debug)
 end
 
 local function qrcode(str, ec_level, mode_enc)
-	local _, ec, size, stride, total_words, entry = prepare_boards(str, ec_level, mode_enc)
-	local best_mask = search_masks(size, stride, total_words, ec, entry)
+	local version, ec, size, padded_size, stride, total_words, entry, padding = prepare_boards(str, ec_level, mode_enc)
+
+	local best_mask = search_masks(size, padded_size, stride, total_words, ec, entry, padding, false)
 
 	local len = size * size
 	ffi.copy(best_matrix, base_matrix, len + 1)
@@ -983,10 +1016,21 @@ end
 -- internally but normally discards, by calling the exact same two
 -- functions qrcode() calls.
 local function debug_mask_penalties(str, ec_level, mode_enc)
-	local version, ec, size, stride, total_words, entry = prepare_boards(str, ec_level, mode_enc)
-	-- Pass true to gather the components table for the test suite
-	local best_mask, components = search_masks(size, stride, total_words, ec, entry, true)
-	return { version = version, ec = ec, components = components, best_mask = best_mask }
+	local version, ec, size, padded_size, stride, total_words, entry, padding, total_arranged_bytes = prepare_boards(str, ec_level, mode_enc)
+	local best_mask, components = search_masks(size, padded_size, stride, total_words, ec, entry, padding, true)
+
+	local codewords = {}
+	for i = 1, total_arranged_bytes do
+		codewords[i] = arranged_data[i]
+	end
+
+	return {
+		version = version,
+		ec = ec,
+		components = components,
+		best_mask = best_mask,
+		codewords = codewords,
+	}
 end
 
 return {
