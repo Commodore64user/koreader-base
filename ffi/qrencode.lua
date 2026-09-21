@@ -737,45 +737,6 @@ local function scan_p1p3(bb, size, stride, sm)
 	return p1, p3
 end
 
-local function calculate_penalty_bb(bb, tbb, size, stride)
-	local sm = get_size_masks(size, stride)
-	local p1, p3 = scan_p1p3(bb, size, stride, sm)
-	local p1v, p3v = scan_p1p3(tbb, size, stride, sm)
-	p1 = p1 + p1v
-	p3 = p3 + p3v
-
-	-- P2 (2x2 blocks) and dark ratio, word-parallel with SWAR popcount
-	local p2, dark = 0, 0
-	local w_end = stride - 1
-	local p2m = sm.p2
-	for y = 0, size - 1 do
-		local offA = y * stride
-		for w = 0, w_end do
-			dark = dark + popcount32(bb[offA + w])
-		end
-		if y < size - 1 then
-			local offB = offA + stride
-			for w = 0, w_end do
-				local a = bb[offA + w]
-				local b2 = bb[offB + w]
-				local d = bor(bor(bxor(a, rshift(a, 1)), bxor(a, b2)), bxor(b2, rshift(b2, 1)))
-				p2 = p2 + popcount32(band(bnot(d), p2m[w])) * 3
-				if w * 32 + 31 <= size - 2 then
-					local a31 = rshift(a, 31)
-					local b31 = rshift(b2, 31)
-					if a31 == b31 and a31 == band(bb[offA + w + 1], 1) and b31 == band(bb[offB + w + 1], 1) then
-						p2 = p2 + 3
-					end
-				end
-			end
-		end
-	end
-
-	local percent = dark / (size * size) * 100
-	local p4 = floor(abs(50 - percent) / 5) * 10
-	return p1 + p2 + p3 + p4
-end
-
 -- Typeinfo bits into a board and its transpose in one pass.
 local function add_typeinfo_both(bb, tbb, size, stride, ec_level, mask)
 	local ec_mask_type = typeinfo[ec_level][mask]
@@ -870,7 +831,48 @@ local function build_static(version, size, stride)
 	return entry
 end
 
-local function qrcode(str, ec_level, mode_enc)
+-- Computes all four penalty components for a mask's board pair.
+local function compute_penalty_components(bb, tbb, size, stride)
+	local sm = get_size_masks(size, stride)
+	local p1, p3 = scan_p1p3(bb, size, stride, sm)
+	local p1v, p3v = scan_p1p3(tbb, size, stride, sm)
+	p1 = p1 + p1v
+	p3 = p3 + p3v
+
+	local p2, dark = 0, 0
+	local w_end = stride - 1
+	local p2m = sm.p2
+	for y = 0, size - 1 do
+		local offA = y * stride
+		for w = 0, w_end do
+			dark = dark + popcount32(bb[offA + w])
+		end
+		if y < size - 1 then
+			local offB = offA + stride
+			for w = 0, w_end do
+				local a = bb[offA + w]
+				local b2 = bb[offB + w]
+				local d = bor(bor(bxor(a, rshift(a, 1)), bxor(a, b2)), bxor(b2, rshift(b2, 1)))
+				p2 = p2 + popcount32(band(bnot(d), p2m[w])) * 3
+				if w * 32 + 31 <= size - 2 then
+					local a31 = rshift(a, 31)
+					local b31 = rshift(b2, 31)
+					if a31 == b31 and a31 == band(bb[offA + w + 1], 1) and b31 == band(bb[offB + w + 1], 1) then
+						p2 = p2 + 3
+					end
+				end
+			end
+		end
+	end
+
+	local percent = dark / (size * size) * 100
+	local p4 = floor(abs(50 - percent) / 5) * 10
+	return p1, p2, p3, p4
+end
+
+-- Shared setup: encodes `str`, builds the base (unmasked) bitboards, and
+-- returns everything the mask search needs.
+local function prepare_boards(str, ec_level, mode_enc)
 	local mode_num = mode_enc or get_mode(str)
 	local version, ec = get_version_eclevel(#str, mode_num, ec_level)
 
@@ -883,10 +885,8 @@ local function qrcode(str, ec_level, mode_enc)
 	local total_arranged_bytes = arrange_codewords_and_calculate_ec(version, ec, bw.buf)
 	local size = generate_base_matrix(version)
 
-	-- BUG 1 FIX: Shield typeinfo cells from being treated as free data cells
 	add_typeinfo_to_matrix(base_matrix, size, ec, 0)
 
-	local len = size * size
 	local stride = floor((size + 31) / 32)
 	local total_words = size * stride
 
@@ -926,6 +926,14 @@ local function qrcode(str, ec_level, mode_enc)
 
 	transpose_bb(bb_base, T_base, size, stride)
 
+	return version, ec, size, stride, total_words, entry
+end
+
+-- Shared mask search: scores all 8 masks and returns the winner plus
+-- the full per-mask p1/p2/p3/p4 breakdown. qrcode() uses only
+-- best_mask; debug_mask_penalties() uses both.
+local function search_masks(size, stride, total_words, ec, entry, is_debug)
+	local components = is_debug and {} or nil
 	local min_penalty, best_mask = nil, 0
 	for mask = 0, 7 do
 		local mb = entry.masks[mask]
@@ -936,18 +944,31 @@ local function qrcode(str, ec_level, mode_enc)
 		end
 		add_typeinfo_both(bb_scratch, T_scratch, size, stride, ec, mask)
 
-		local penalty = calculate_penalty_bb(bb_scratch, T_scratch, size, stride)
+		local p1, p2, p3, p4 = compute_penalty_components(bb_scratch, T_scratch, size, stride)
+
+		if is_debug then
+			components[mask] = { p1 = p1, p2 = p2, p3 = p3, p4 = p4 }
+		end
+
+		local penalty = p1 + p2 + p3 + p4
 		if not min_penalty or penalty < min_penalty then
 			min_penalty = penalty
 			best_mask = mask
 		end
 	end
+	return best_mask, components
+end
 
+local function qrcode(str, ec_level, mode_enc)
+	local _, ec, size, stride, total_words, entry = prepare_boards(str, ec_level, mode_enc)
+	local best_mask = search_masks(size, stride, total_words, ec, entry)
+
+	local len = size * size
 	ffi.copy(best_matrix, base_matrix, len + 1)
 	add_typeinfo_to_matrix(best_matrix, size, ec, best_mask)
 
 	local func = maskFunc[best_mask]
-	for k = 1, count do
+	for k = 1, entry.count do
 		local data_bit = raw_bit[k]
 		if func(entry.x[k], entry.y[k]) then
 			data_bit = bxor(data_bit, 1)
@@ -958,6 +979,17 @@ local function qrcode(str, ec_level, mode_enc)
 	return true, best_matrix, size
 end
 
+-- Test-facing only: exposes the per-mask components qrcode() computes
+-- internally but normally discards, by calling the exact same two
+-- functions qrcode() calls.
+local function debug_mask_penalties(str, ec_level, mode_enc)
+	local version, ec, size, stride, total_words, entry = prepare_boards(str, ec_level, mode_enc)
+	-- Pass true to gather the components table for the test suite
+	local best_mask, components = search_masks(size, stride, total_words, ec, entry, true)
+	return { version = version, ec = ec, components = components, best_mask = best_mask }
+end
+
 return {
 	qrcode = qrcode,
+	_debug_mask_penalties = debug_mask_penalties,
 }
