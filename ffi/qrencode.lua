@@ -49,18 +49,9 @@ local base_matrix = ffi.new("int8_t[?]", MAX_QR_LEN + 1)
 local best_matrix = ffi.new("int8_t[?]", MAX_QR_LEN + 1)
 local raw_bit     = ffi.new("int8_t[?]", MAX_QR_LEN + 1)
 
-local free_idx    = ffi.new("int32_t[?]", MAX_QR_LEN + 1)
-local x_coords    = ffi.new("int16_t[?]", MAX_QR_LEN + 1)
-local y_coords    = ffi.new("int16_t[?]", MAX_QR_LEN + 1)
-
 -- uint32_t Bitboards for the Penalty Pipeline
 local bb_base    = ffi.new("uint32_t[?]", MAX_BB_LEN)
 local bb_scratch = ffi.new("uint32_t[?]", MAX_BB_LEN)
-local bb_t       = ffi.new("uint32_t[?]", MAX_BB_LEN)
-local bb_masks   = {}
-for i = 0, 7 do
-	bb_masks[i] = ffi.new("uint32_t[?]", MAX_BB_LEN)
-end
 
 -- Encoding and EC block caches
 local bw_buf             = ffi.new("uint8_t[?]", 4001)
@@ -461,33 +452,6 @@ local typeinfo = {
 	{ [0] = "001011010001001", "001001110111110", "001110011100111", "001100111010000", "000011101100010", "000001001010101", "000110100001100", "000100000111011" }
 }
 
-local function add_typeinfo_to_bb(bb, size, stride, ec_level, mask)
-	local ec_mask_type = typeinfo[ec_level][mask]
-	local bit_val
-	for i = 1, 7 do
-		bit_val = sub(ec_mask_type, i, i) == "1" and 1 or 0
-		set_bb_bit(bb, stride, 9, size - i + 1, bit_val)
-	end
-	for i = 8, 9 do
-		bit_val = sub(ec_mask_type, i, i) == "1" and 1 or 0
-		set_bb_bit(bb, stride, 9, 17 - i, bit_val)
-	end
-	for i = 10, 15 do
-		bit_val = sub(ec_mask_type, i, i) == "1" and 1 or 0
-		set_bb_bit(bb, stride, 9, 16 - i, bit_val)
-	end
-	for i = 1, 6 do
-		bit_val = sub(ec_mask_type, i, i) == "1" and 1 or 0
-		set_bb_bit(bb, stride, i, 9, bit_val)
-	end
-	bit_val = sub(ec_mask_type, 7, 7) == "1" and 1 or 0
-	set_bb_bit(bb, stride, 8, 9, bit_val)
-	for i = 8, 15 do
-		bit_val = sub(ec_mask_type, i, i) == "1" and 1 or 0
-		set_bb_bit(bb, stride, size - 15 + i, 9, bit_val)
-	end
-end
-
 local function add_typeinfo_to_matrix(matrix, size, ec_level, mask)
 	local ec_mask_type = typeinfo[ec_level][mask]
 	local bit_val
@@ -614,93 +578,296 @@ local maskFunc = {
 	function(x,y) return ((y*x)%3+y+x)%2==0 end,
 }
 
-local function calculate_penalty_bb(bb, size, stride, t_bb)
-	local p1, p2, p3 = 0, 0, 0
-	local dark_cells = 0
-	ffi.fill(t_bb, size * stride * 4, 0)
+local function popcount32(x)
+	x = x - band(rshift(x, 1), 0x55555555)
+	x = band(x, 0x33333333) + band(rshift(x, 2), 0x33333333)
+	x = band(x + rshift(x, 4), 0x0F0F0F0F)
+	return band(x, 0xFF) + band(rshift(x, 8), 0xFF) + band(rshift(x, 16), 0xFF) + rshift(x, 24)
+end
 
-	-- Horizontal P1, P2, P3, and Transpose
+-- SWAR penalty scratch: c_bb holds per-word "differs from left" bits,
+-- T_base/T_scratch are transposed boards for the vertical pass.
+local c_bb      = ffi.new("uint32_t[?]", MAX_BB_LEN)
+local T_base    = ffi.new("uint32_t[?]", MAX_BB_LEN)
+local T_scratch = ffi.new("uint32_t[?]", MAX_BB_LEN)
+local tr_buf    = ffi.new("uint32_t[?]", 32)
+
+local sz_cache = {}
+
+-- Valid pattern-start positions p within word w (p + width <= size).
+local function start_mask(size, w, width)
+	local maxp = size - width - w * 32
+	if maxp < 0 then return 0 end
+	if maxp >= 31 then return -1 end
+	return lshift(1, maxp + 1) - 1
+end
+
+local function get_size_masks(size, stride)
+	local e = sz_cache[size]
+	if e then return e end
+	e = { v5 = {}, m3 = {}, m15 = {}, p2 = {} }
+	for w = 0, stride - 1 do
+		e.v5[w]  = start_mask(size, w, 5)
+		e.m3[w]  = start_mask(size, w, 11)
+		e.m15[w] = start_mask(size, w, 15)
+		e.p2[w]  = band(start_mask(size, w, 2), 0x7FFFFFFF)
+	end
+	sz_cache[size] = e
+	return e
+end
+
+-- In-place 32x32 bit matrix transpose on tr_buf. Stage j swaps the j-th
+-- coordinate bit between row and column index for every element.
+local function transpose32()
+	local a, b, t
+	for k = 0, 15 do
+		a, b = tr_buf[k], tr_buf[k + 16]
+		t = band(bxor(rshift(a, 16), b), 0x0000FFFF)
+		tr_buf[k + 16] = bxor(b, t)
+		tr_buf[k] = bxor(a, lshift(t, 16))
+	end
+	for base = 0, 16, 16 do
+		for r = 0, 7 do
+			local k = base + r
+			a, b = tr_buf[k], tr_buf[k + 8]
+			t = band(bxor(rshift(a, 8), b), 0x00FF00FF)
+			tr_buf[k + 8] = bxor(b, t)
+			tr_buf[k] = bxor(a, lshift(t, 8))
+		end
+	end
+	for base = 0, 24, 8 do
+		for r = 0, 3 do
+			local k = base + r
+			a, b = tr_buf[k], tr_buf[k + 4]
+			t = band(bxor(rshift(a, 4), b), 0x0F0F0F0F)
+			tr_buf[k + 4] = bxor(b, t)
+			tr_buf[k] = bxor(a, lshift(t, 4))
+		end
+	end
+	for base = 0, 28, 4 do
+		for r = 0, 1 do
+			local k = base + r
+			a, b = tr_buf[k], tr_buf[k + 2]
+			t = band(bxor(rshift(a, 2), b), 0x33333333)
+			tr_buf[k + 2] = bxor(b, t)
+			tr_buf[k] = bxor(a, lshift(t, 2))
+		end
+	end
+	for base = 0, 30, 2 do
+		a, b = tr_buf[base], tr_buf[base + 1]
+		t = band(bxor(rshift(a, 1), b), 0x55555555)
+		tr_buf[base + 1] = bxor(b, t)
+		tr_buf[base] = bxor(a, lshift(t, 1))
+	end
+end
+
+-- Transpose a bitboard into dst (same y-major layout).
+local function transpose_bb(src, dst, size, stride)
+	for bx = 0, stride - 1 do
+		for by = 0, stride - 1 do
+			local navail = size - by * 32
+			if navail > 32 then navail = 32 end
+			for r = 0, 31 do
+				tr_buf[r] = r < navail and src[(by * 32 + r) * stride + bx] or 0
+			end
+			transpose32()
+			for c = 0, 31 do
+				local row = bx * 32 + c
+				if row < size then dst[row * stride + by] = tr_buf[c] end
+			end
+		end
+	end
+end
+
+-- P1 (runs >= 5) and P3 (finder-like patterns), one 32-bit word at a time.
+local function scan_p1p3(bb, size, stride, sm)
+	local v5, m3, m15 = sm.v5, sm.m3, sm.m15
+	local w_end = stride - 1
+	local p1, p3 = 0, 0
 	for y = 0, size - 1 do
-		local offset = y * stride
-		local offset_next = (y + 1) * stride
-		local consec = 0
-		local last_b = -1
-		local window = 0
-		local last_p3 = -10
-		for x = 0, size - 1 do
-			local word_idx = floor(x / 32)
-			local bit_offset = x % 32
-			local b = band(rshift(bb[offset + word_idx], bit_offset), 1)
-
-			if b == 1 then
-				dark_cells = dark_cells + 1
-				local t_w = x * stride + floor(y / 32)
-				t_bb[t_w] = bor(t_bb[t_w], lshift(1, y % 32))
-			end
-
-			if b == last_b then consec = consec + 1
+		local off = y * stride
+		local prev31 = 0
+		for w = 0, w_end do
+			local b = bb[off + w]
+			if w == 0 then
+				c_bb[off + w] = bor(bxor(b, lshift(b, 1)), 1)
 			else
-				if consec >= 5 then p1 = p1 + consec - 2 end
-				consec = 1
-				last_b = b
+				c_bb[off + w] = bxor(b, bor(lshift(b, 1), prev31))
 			end
-
-			window = band(bor(lshift(window, 1), b), 0x7FF)
-			if x >= 10 then
-				if window == 0x05D then
-					p3 = p3 + 40
-					last_p3 = x
-				elseif window == 0x5D0 and last_p3 ~= x - 4 then
-					p3 = p3 + 40
-				end
+			prev31 = rshift(b, 31)
+		end
+		for w = 0, w_end do
+			local c = c_bb[off + w]
+			local z1 = bor(bor(rshift(c, 1), rshift(c, 2)), bor(rshift(c, 3), rshift(c, 4)))
+			if w < w_end then
+				local cx = c_bb[off + w + 1]
+				z1 = bor(z1, lshift(cx, 28), lshift(cx, 29), lshift(cx, 30), lshift(cx, 31))
 			end
+			local A = band(v5[w], bxor(z1, -1))
+			p1 = p1 + popcount32(A) + 2 * popcount32(band(A, c))
 
-			if y < size - 1 and x < size - 1 then
-				local word_idx_rx = floor((x+1) / 32)
-				local bit_offset_rx = (x+1) % 32
-				local b_right = band(rshift(bb[offset + word_idx_rx], bit_offset_rx), 1)
-				local b_down = band(rshift(bb[offset_next + word_idx], bit_offset), 1)
-				local b_down_right = band(rshift(bb[offset_next + word_idx_rx], bit_offset_rx), 1)
-				if b == b_right and b == b_down and b == b_down_right then
-					p2 = p2 + 3
+			local b = bb[off + w]
+			local bnext = w < w_end and bb[off + w + 1] or 0
+			local s0 = b
+			local s1 = bor(rshift(b, 1), lshift(bnext, 31))
+			local s2 = bor(rshift(b, 2), lshift(bnext, 30))
+			local s3 = bor(rshift(b, 3), lshift(bnext, 29))
+			local s4 = bor(rshift(b, 4), lshift(bnext, 28))
+			local s5 = bor(rshift(b, 5), lshift(bnext, 27))
+			local s6 = bor(rshift(b, 6), lshift(bnext, 26))
+			local s7 = bor(rshift(b, 7), lshift(bnext, 25))
+			local s8 = bor(rshift(b, 8), lshift(bnext, 24))
+			local s9 = bor(rshift(b, 9), lshift(bnext, 23))
+			local s10 = bor(rshift(b, 10), lshift(bnext, 22))
+			local TA = band(band(band(s4, s6), band(s7, s8)), s10)
+			local NA = bor(bor(bor(s0, s1), bor(s2, s3)), bor(s5, s9))
+			local TB = band(band(band(s0, s2), band(s3, s4)), s6)
+			local NB = bor(bor(bor(s1, s5), bor(s7, s8)), bor(s9, s10))
+			local m3w = m3[w]
+			p3 = p3 + 40 * popcount32(band(band(TA, bxor(NA, -1)), m3w))
+			p3 = p3 + 40 * popcount32(band(band(TB, bxor(NB, -1)), m3w))
+			local s11 = bor(rshift(b, 11), lshift(bnext, 21))
+			local s12 = bor(rshift(b, 12), lshift(bnext, 20))
+			local s13 = bor(rshift(b, 13), lshift(bnext, 19))
+			local s14 = bor(rshift(b, 14), lshift(bnext, 18))
+			local ND = bor(bor(NA, s11), bor(bor(s12, s13), s14))
+			p3 = p3 - 40 * popcount32(band(band(TA, bxor(ND, -1)), m15[w]))
+		end
+	end
+	return p1, p3
+end
+
+local function calculate_penalty_bb(bb, tbb, size, stride)
+	local sm = get_size_masks(size, stride)
+	local p1, p3 = scan_p1p3(bb, size, stride, sm)
+	local p1v, p3v = scan_p1p3(tbb, size, stride, sm)
+	p1 = p1 + p1v
+	p3 = p3 + p3v
+
+	-- P2 (2x2 blocks) and dark ratio, word-parallel with SWAR popcount
+	local p2, dark = 0, 0
+	local w_end = stride - 1
+	local p2m = sm.p2
+	for y = 0, size - 1 do
+		local offA = y * stride
+		for w = 0, w_end do
+			dark = dark + popcount32(bb[offA + w])
+		end
+		if y < size - 1 then
+			local offB = offA + stride
+			for w = 0, w_end do
+				local a = bb[offA + w]
+				local b2 = bb[offB + w]
+				local d = bor(bor(bxor(a, rshift(a, 1)), bxor(a, b2)), bxor(b2, rshift(b2, 1)))
+				p2 = p2 + popcount32(band(bnot(d), p2m[w])) * 3
+				if w * 32 + 31 <= size - 2 then
+					local a31 = rshift(a, 31)
+					local b31 = rshift(b2, 31)
+					if a31 == b31 and a31 == band(bb[offA + w + 1], 1) and b31 == band(bb[offB + w + 1], 1) then
+						p2 = p2 + 3
+					end
 				end
 			end
 		end
-		if consec >= 5 then p1 = p1 + consec - 2 end
 	end
 
-	-- Vertical P1 & P3
-	for y = 0, size - 1 do
-		local offset = y * stride
-		local consec = 0
-		local last_b = -1
-		local window = 0
-		local last_p3 = -10
-		for x = 0, size - 1 do
-			local b = band(rshift(t_bb[offset + floor(x / 32)], x % 32), 1)
-			if b == last_b then consec = consec + 1
-			else
-				if consec >= 5 then p1 = p1 + consec - 2 end
-				consec = 1
-				last_b = b
-			end
-
-			window = band(bor(lshift(window, 1), b), 0x7FF)
-			if x >= 10 then
-				if window == 0x05D then
-					p3 = p3 + 40
-					last_p3 = x
-				elseif window == 0x5D0 and last_p3 ~= x - 4 then
-					p3 = p3 + 40
-				end
-			end
-		end
-		if consec >= 5 then p1 = p1 + consec - 2 end
-	end
-
-	local dark_ratio = dark_cells / (size * size)
-	local p4 = floor(abs(dark_ratio * 100 - 50)) * 2
+	local percent = dark / (size * size) * 100
+	local p4 = floor(abs(50 - percent) / 5) * 10
 	return p1 + p2 + p3 + p4
+end
+
+-- Typeinfo bits into a board and its transpose in one pass.
+local function add_typeinfo_both(bb, tbb, size, stride, ec_level, mask)
+	local ec_mask_type = typeinfo[ec_level][mask]
+	local bit_val
+	for i = 1, 7 do
+		bit_val = sub(ec_mask_type, i, i) == "1" and 1 or 0
+		set_bb_bit(bb, stride, 9, size - i + 1, bit_val)
+		set_bb_bit(tbb, stride, size - i + 1, 9, bit_val)
+	end
+	for i = 8, 9 do
+		bit_val = sub(ec_mask_type, i, i) == "1" and 1 or 0
+		set_bb_bit(bb, stride, 9, 17 - i, bit_val)
+		set_bb_bit(tbb, stride, 17 - i, 9, bit_val)
+	end
+	for i = 10, 15 do
+		bit_val = sub(ec_mask_type, i, i) == "1" and 1 or 0
+		set_bb_bit(bb, stride, 9, 16 - i, bit_val)
+		set_bb_bit(tbb, stride, 16 - i, 9, bit_val)
+	end
+	for i = 1, 6 do
+		bit_val = sub(ec_mask_type, i, i) == "1" and 1 or 0
+		set_bb_bit(bb, stride, i, 9, bit_val)
+		set_bb_bit(tbb, stride, 9, i, bit_val)
+	end
+	bit_val = sub(ec_mask_type, 7, 7) == "1" and 1 or 0
+	set_bb_bit(bb, stride, 8, 9, bit_val)
+	set_bb_bit(tbb, stride, 9, 8, bit_val)
+	for i = 8, 15 do
+		bit_val = sub(ec_mask_type, i, i) == "1" and 1 or 0
+		set_bb_bit(bb, stride, size - 15 + i, 9, bit_val)
+		set_bb_bit(tbb, stride, 9, size - 15 + i, bit_val)
+	end
+end
+
+-- Per-version static state: zigzag free-cell order, mask bitboards (and
+-- their transposes), and per-EC fixed-dark bitboards.
+local static_cache = {}
+
+local function build_static(version, size, stride)
+	local total_words = size * stride
+	local n_cells = size * size
+	local entry = {
+		count = 0,
+		free = ffi.new("int32_t[?]", n_cells + 1),
+		x = ffi.new("int16_t[?]", n_cells + 1),
+		y = ffi.new("int16_t[?]", n_cells + 1),
+		masks = {},
+		t_masks = {},
+		fixed = {},
+	}
+	for m = 0, 7 do entry.masks[m] = ffi.new("uint32_t[?]", total_words) end
+	local count = 0
+	local x, y = size, size
+	local x_dir, y_dir = -1, -1
+	while x >= 1 do
+		local idx = (y - 1) * size + x
+		if base_matrix[idx] == 0 then
+			count = count + 1
+			entry.free[count] = idx
+			entry.x[count] = x - 1
+			entry.y[count] = y - 1
+		end
+		x = x + x_dir
+		if x_dir == 1 then
+			y = y + y_dir
+			if y < 1 or y > size then
+				x = x - 2
+				if x == 7 then x = 6 end
+				y = y_dir == -1 and 1 or size
+				y_dir = -y_dir
+			end
+		end
+		x_dir = -x_dir
+	end
+	entry.count = count
+	for m = 0, 7 do
+		local func = maskFunc[m]
+		local mb = entry.masks[m]
+		for k = 1, count do
+			if func(entry.x[k], entry.y[k]) then
+				set_bb_bit(mb, stride, entry.x[k] + 1, entry.y[k] + 1, 1)
+			end
+		end
+	end
+	for m = 0, 7 do
+		transpose_bb(entry.masks[m], T_base, size, stride)
+		local tb = ffi.new("uint32_t[?]", total_words)
+		ffi.copy(tb, T_base, total_words * 4)
+		entry.t_masks[m] = tb
+	end
+	static_cache[version] = entry
+	return entry
 end
 
 local function qrcode(str, ec_level, mode_enc)
@@ -723,77 +890,53 @@ local function qrcode(str, ec_level, mode_enc)
 	local stride = floor((size + 31) / 32)
 	local total_words = size * stride
 
-	ffi.fill(bb_base, total_words * 4, 0)
-	for m = 0, 7 do ffi.fill(bb_masks[m], total_words * 4, 0) end
+	local entry = static_cache[version] or build_static(version, size, stride)
+	local count = entry.count
 
-	local free_count = 0
-	local bit_idx = 0
+	local fixed_dark = entry.fixed[ec]
+	if not fixed_dark then
+		fixed_dark = ffi.new("uint32_t[?]", total_words)
+		for yi = 1, size do
+			local rowbase = (yi - 1) * size
+			for xi = 1, size do
+				if base_matrix[rowbase + xi] == 2 then
+					set_bb_bit(fixed_dark, stride, xi, yi, 1)
+				end
+			end
+		end
+		entry.fixed[ec] = fixed_dark
+	end
+
+	ffi.copy(bb_base, fixed_dark, total_words * 4)
+
 	local total_bits = total_arranged_bytes * 8
-
-	local x, y = size, size
-	local x_dir, y_dir = -1, -1
-
-	while x >= 1 do
-		local idx = (y - 1) * size + x
-		if base_matrix[idx] == 0 then
-			local data_bit = 0
-			if bit_idx < total_bits then
-				local byte_idx = floor(bit_idx / 8) + 1
-				local b_shift = 7 - (bit_idx % 8)
-				data_bit = band(rshift(arranged_data[byte_idx], b_shift), 1)
-			end
-			bit_idx = bit_idx + 1
-
-			free_count = free_count + 1
-			free_idx[free_count] = idx
-			x_coords[free_count] = x - 1
-			y_coords[free_count] = y - 1
-			raw_bit[free_count] = data_bit
+	for k = 1, count do
+		local data_bit = 0
+		if k <= total_bits then
+			local bi = k - 1
+			data_bit = band(rshift(arranged_data[floor(bi / 8) + 1], 7 - bi % 8), 1)
 		end
-
-		x = x + x_dir
-		if x_dir == 1 then
-			y = y + y_dir
-			if y < 1 or y > size then
-				x = x - 2
-				if x == 7 then x = 6 end
-				y = y_dir == -1 and 1 or size
-				y_dir = -y_dir
-			end
-		end
-		x_dir = -x_dir
-	end
-
-	-- Populate bb_base with raw bits and fixed pixels
-	for yi = 1, size do
-		for xi = 1, size do
-			local v = base_matrix[(yi - 1) * size + xi]
-			if v == 2 or v == 1 then set_bb_bit(bb_base, stride, xi, yi, 1) end
-		end
-	end
-	for k = 1, free_count do
-		if raw_bit[k] == 1 then set_bb_bit(bb_base, stride, x_coords[k] + 1, y_coords[k] + 1, 1) end
-	end
-
-	-- Populate bb_masks only on free cells
-	for m = 0, 7 do
-		local func = maskFunc[m]
-		for k = 1, free_count do
-			if func(x_coords[k], y_coords[k]) then
-				set_bb_bit(bb_masks[m], stride, x_coords[k] + 1, y_coords[k] + 1, 1)
-			end
+		raw_bit[k] = data_bit
+		if data_bit == 1 then
+			local xx, yy = entry.x[k], entry.y[k]
+			local wi = yy * stride + floor(xx / 32)
+			bb_base[wi] = bor(bb_base[wi], lshift(1, xx % 32))
 		end
 	end
 
-	local min_penalty = nil
-	local best_mask = 0
+	transpose_bb(bb_base, T_base, size, stride)
 
+	local min_penalty, best_mask = nil, 0
 	for mask = 0, 7 do
-		-- Apply Mask instantly
-		for i = 0, total_words - 1 do bb_scratch[i] = bxor(bb_base[i], bb_masks[mask][i]) end
-		add_typeinfo_to_bb(bb_scratch, size, stride, ec, mask)
+		local mb = entry.masks[mask]
+		local tb = entry.t_masks[mask]
+		for i = 0, total_words - 1 do
+			bb_scratch[i] = bxor(bb_base[i], mb[i])
+			T_scratch[i] = bxor(T_base[i], tb[i])
+		end
+		add_typeinfo_both(bb_scratch, T_scratch, size, stride, ec, mask)
 
-		local penalty = calculate_penalty_bb(bb_scratch, size, stride, bb_t)
+		local penalty = calculate_penalty_bb(bb_scratch, T_scratch, size, stride)
 		if not min_penalty or penalty < min_penalty then
 			min_penalty = penalty
 			best_mask = mask
@@ -804,16 +947,17 @@ local function qrcode(str, ec_level, mode_enc)
 	add_typeinfo_to_matrix(best_matrix, size, ec, best_mask)
 
 	local func = maskFunc[best_mask]
-	for k = 1, free_count do
-		local invert = func(x_coords[k], y_coords[k])
+	for k = 1, count do
 		local data_bit = raw_bit[k]
-		if invert then data_bit = bxor(data_bit, 1) end
-		best_matrix[free_idx[k]] = data_bit == 1 and 1 or -1
+		if func(entry.x[k], entry.y[k]) then
+			data_bit = bxor(data_bit, 1)
+		end
+		best_matrix[entry.free[k]] = data_bit == 1 and 1 or -1
 	end
 
 	return true, best_matrix, size
 end
 
 return {
-    qrcode = qrcode
+	qrcode = qrcode,
 }
