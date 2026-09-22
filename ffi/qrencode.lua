@@ -108,9 +108,13 @@ end
 --- =========================================================
 
 local function get_mode(str)
-	if match(str,"^[0-9]+$") then return 1
-	elseif match(str,"^[0-9A-Z $%%*./:+-]+$") then return 2
-	else return 4 end
+	if match(str,"^[0-9]+$") then
+		return 1
+	elseif match(str,"^[0-9A-Z $%%*./:+-]+$") then
+		return 2
+	else
+		return 4
+	end
 end
 
 local capacity = {
@@ -143,14 +147,23 @@ local function get_version_eclevel(len,mode,requested_ec_level)
 	for ec_level = minlv, maxlv do
 		for version = 1, #capacity do
 			bits = capacity[version][ec_level] * 8 - 4
-			if version < 10 then digits = tab[1][local_mode]
-			elseif version < 27 then digits = tab[2][local_mode]
-			elseif version <= 40 then digits = tab[3][local_mode] end
+			if version < 10 then
+				digits = tab[1][local_mode]
+			elseif version < 27 then
+				digits = tab[2][local_mode]
+			elseif version <= 40 then
+				digits = tab[3][local_mode]
+			end
 			modebits = bits - digits
-			if local_mode == 1 then c = floor(modebits * 3 / 10)
-			elseif local_mode == 2 then c = floor(modebits * 2 / 11)
-			elseif local_mode == 3 then c = floor(modebits * 1 / 8)
-			else c = floor(modebits * 1 / 13) end
+			if local_mode == 1 then
+				c = floor(modebits * 3 / 10)
+			elseif local_mode == 2 then
+				c = floor(modebits * 2 / 11)
+			elseif local_mode == 3 then
+				c = floor(modebits * 1 / 8)
+			else
+				c = floor(modebits * 1 / 13)
+			end
 
 			if c >= len then
 				if version <= minversion then
@@ -167,12 +180,20 @@ end
 
 local function write_length(str_len, version, mode)
 	local i = mode
-	if mode == 4 then i = 3 elseif mode == 8 then i = 4 end
+	if mode == 4 then
+		i = 3
+	elseif mode == 8 then
+		i = 4
+	end
 	local tab = { {10,9,8,8},{12,11,16,10},{14,13,16,12} }
 	local digits
-	if version < 10 then digits = tab[1][i]
-	elseif version < 27 then digits = tab[2][i]
-	elseif version <= 40 then digits = tab[3][i] end
+	if version < 10 then
+		digits = tab[1][i]
+	elseif version < 27 then
+		digits = tab[2][i]
+	elseif version <= 40 then
+		digits = tab[3][i]
+	end
 	bw:write(str_len, digits)
 end
 
