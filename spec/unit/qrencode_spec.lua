@@ -26,15 +26,27 @@ describe("QRencode module", function()
         assert.are.same(table.concat(ret, ''), result)
     end)
 
-    -- This refers to the standard ISO/IEC 18004 published in 2006
-    describe("encoding pipeline (ISO/IEC 18004 Annex I worked example)", function()
-		it("selects numeric mode and version 1 for the Annex I string", function()
+    -- ISO/IEC 18004:2006(E): https://abcdocz.com/doc/1124990/iso-iec-18004
+    -- Annex I.1: "This Annex describes the encoding of the data string '01234567'
+    -- into both a QR Code symbol and a Micro QR Code symbol."
+    -- Annex I.2: "The data string is to be encoded into a version 1-M symbol,
+    -- using the Numeric mode in accordance with 6.4.3."
+    describe("encoding pipeline (ISO/IEC 18004:2006 Annex I.2 worked example)", function()
+		it("selects numeric mode, version 1, EC level M, per Annex I.2's stated setup", function()
 			local result = qrencode._debug_mask_penalties("01234567", 2) -- 2 = EC level M
 			assert.are.equal(1, result.version)
 			assert.are.equal(2, result.ec)
 		end)
 
-		it("generates exact data and Reed-Solomon parity codewords for Annex I", function()
+		-- Annex I.2 Step 1 gives the final padded bitstream as:
+		--   00010000 00100000 00001100 01010110 01100001 10000000
+		--   11101100 00010001 11101100 00010001 11101100 00010001
+		--   11101100 00010001 11101100 00010001
+		-- Step 2 appends the 10 RS parity codewords (version 1-M has a single,
+		-- non-interleaved block, so no weaving is needed):
+		--   10100101 00100100 11010100 11000001 11101101 00110110
+		--   11000111 10000111 00101100 01010101
+		it("generates exact data and Reed-Solomon parity codewords (Annex I.2, Steps 1-2)", function()
 			local result = qrencode._debug_mask_penalties("01234567", 2)
 			local expected_codewords = {
 				-- 16 Data codewords (mode, character count, payload, terminator, 0xEC/0x11 pad bytes)
@@ -45,33 +57,34 @@ describe("QRencode module", function()
 			}
 			assert.are.same(expected_codewords, result.codewords)
 		end)
-	end)
 
-    -- The following tests are based on the worked example in ISO/IEC 18004 (2000) Annex G, with corrections from Persson's published errata.
-    -- A copy of Johan Persson's paper can be found at https://www.coastalmonitoring.org/resources/jpclass/QR/qr-comment.pdf
-
-	describe("encoding pipeline (ISO/IEC 18004 Annex G worked example)", function()
-		it("selects numeric mode and version 1 for the Annex G string", function()
-			local result = qrencode._debug_mask_penalties("01234567", 2) -- 2 = EC level M
-			assert.are.equal(1, result.version)
-			assert.are.equal(2, result.ec)
+		-- Annex I.2 Step 4: "Apply the data masking patterns defined in 6.8.1 in
+		-- turn and evaluate the results in accordance with 6.8.2. The data
+		-- masking pattern selected is referenced 010." (= mask 2). Confirmed
+		-- independently by the format-information bits given directly after
+		-- ("00 010") in Step 5, which agree with the Step 4 caption.
+		it("selects mask 2, matching Annex I.2 Step 4 directly", function()
+			local result = qrencode._debug_mask_penalties("01234567", 2)
+			assert.are.equal(2, result.best_mask)
 		end)
 	end)
 
-	describe("mask penalty scoring vs Persson's published correction to Annex G", function()
+	-- J. Persson, "A note on minor errors in the International QR Barcode standard" (2008):
+	-- https://www.coastalmonitoring.org/resources/jpclass/QR/qr-comment.pdf
+	-- Persson's target was the 2000 edition's Annex G, which (for this same
+	-- "01234567"/version 1-M input) selected mask 3 with a penalty breakdown
+	-- that fails the standard's own scoring rules - mask 3 incurs a false
+	-- 1:1:3:1:1 finder-like match that mask 7 avoids, so mask 7 scores lower.
+	-- Persson's paper only compares masks 3 and 7; it does not claim mask 7
+	-- is the global optimum. The 2006 edition's Annex I.2 (tested above)
+	-- independently settles that question directly: mask 2 is correct.
+	describe("mask penalty scoring vs Persson's published correction to the 2000-edition Annex G", function()
 		local result = qrencode._debug_mask_penalties("01234567", 2)
 
-        -- Persson's paper famously used Mask 7 to debunk the ISO standard's erroneous choice of Mask 3.
-        -- Persson proved that Mask 7 mathematically beats Mask 3. However, when a fully compliant, bug-free
-        -- penalty scorer evaluates all eight masks for the string "01234567" at Level M,
-        -- Mask 2 actually yields an even lower total penalty than Mask 7.
-		it("evaluates Mask 7 as having a lower penalty than Mask 3, correcting Annex G's example", function()
+		it("evaluates mask 7 as having a lower total penalty than mask 3, as Persson demonstrated", function()
 			local p_mask3 = result.components[3].p1 + result.components[3].p2 + result.components[3].p3 + result.components[3].p4
 			local p_mask7 = result.components[7].p1 + result.components[7].p2 + result.components[7].p3 + result.components[7].p4
 			assert.is_true(p_mask7 < p_mask3)
-		end)
-        it("finds Mask 2 is the actual global minimum across all 8 masks for this string", function()
-			assert.are.equal(2, result.best_mask)
 		end)
 
 		it("matches Persson's P1 (line-run) scores exactly", function()
@@ -79,12 +92,30 @@ describe("QRencode module", function()
 			assert.are.equal(176, result.components[7].p1)
 		end)
 
-		it("matches Persson's P2 (2x2 block) scores exactly", function()
+		-- Persson's P2 (2x2 block) figures were computed by hand and are
+		-- documented in his paper as depending on a block-search convention
+		-- the standard itself leaves unspecified. This implementation instead
+		-- follows the convention used by reference libraries such as ZXing/
+		-- rxing, which count every overlapping 2x2 window rather than
+		-- partitioning into disjoint larger blocks - their own source code
+		-- states this is "equivalent to the spec's rule... because this is
+		-- the number of 2x2 blocks inside such a [larger] block." Mask 3's
+		-- score (105) happens to coincide with Persson's hand-computed value
+		-- exactly; mask 7's (150 vs. his 126) diverges, consistent with the
+		-- two methods only disagreeing when a mask produces same-colour
+		-- regions larger than 2x2.
+		it("matches Persson's P2 score for mask 3 exactly; mask 7 differs per the overlapping-window convention", function()
 			assert.are.equal(105, result.components[3].p2)
 			assert.are.equal(150, result.components[7].p2)
 		end)
 
-		it("matches Persson's P3 (finder-like pattern) scores and 40-point gap exactly", function()
+		-- Persson's P3 figures assume scanning extends into the printed
+		-- quiet zone outside the matrix (needed to detect the three real
+		-- finder patterns as 1:1:3:1:1 matches, giving every mask a flat
+		-- +720 baseline). This implementation models that same quiet zone
+		-- explicitly via a 4-module padding border, so it reproduces his
+		-- absolute totals, not just the delta between masks.
+		it("matches Persson's P3 scores and the 40-point mask 3 vs. mask 7 gap exactly", function()
 			assert.are.equal(760, result.components[3].p3)
 			assert.are.equal(720, result.components[7].p3)
 			assert.are.equal(40, result.components[3].p3 - result.components[7].p3)
@@ -123,10 +154,12 @@ describe("QRencode module", function()
 		end
 	end)
 
-    describe("Cross MAX_TEXT_LENGTH boundary", function()
+	-- ISO/IEC 18004:2006(E) §5.1(e)(2): "maximum QR Code symbol size,
+	-- Version 40-L: ... Byte data: 2953".
+	describe("Cross MAX_TEXT_LENGTH boundary (ISO/IEC 18004:2006 section 5.1(e)(2))", function()
 		local base_text = "The quick brown fox jumps over the lazy dog. "
 
-		it("encodes at version 40 (2953 bytes)", function()
+		it("encodes the maximum Version 40-L byte-mode capacity (2953 bytes)", function()
 			local payload = base_text:rep(math.ceil(2953 / #base_text)):sub(1, 2953)
 			local ok, _, size = qrencode.qrcode(payload, 1)
 			assert.are.equal(true, ok)
@@ -141,30 +174,38 @@ describe("QRencode module", function()
 		end)
 	end)
 
-    -- There are several canonical strings and test vectors drawn from the ISO specification, standard
-    -- libraries (libqrencode, ZXing), and Project Nayuki that serve as established ground truths:
-
     describe("specification reference vectors", function()
-		it("encodes ISO/IEC 18004 Section 8.4.3 example 'AC-42' at Version 1-M", function()
-			local res = qrencode._debug_mask_penalties("AC-42", 2)
+		-- ISO/IEC 18004:2006(E) §6.4.4 explicitly provides "AC-42" as the worked evaluation example.
+		it("encodes the standard alphanumeric example 'AC-42' at Version 1-H (ISO/IEC 18004:2006 section 6.4.4)", function()
+			local res = qrencode._debug_mask_penalties("AC-42", 4) -- 4 = EC level H, per the spec's own example
 			assert.are.equal(1, res.version)
-			assert.are.equal(2, res.ec)
+			assert.are.equal(4, res.ec)
 		end)
 
-		it("encodes industry standard 'HELLO WORLD' at Version 1-M", function()
+		-- Not sourced from the standard - a plain smoke test for an ordinary
+		-- alphanumeric string, kept for basic coverage rather than as a
+		-- spec-conformance check.
+		it("encodes 'HELLO WORLD' at Version 1-M", function()
 			local res = qrencode._debug_mask_penalties("HELLO WORLD", 2)
 			assert.are.equal(1, res.version)
 			assert.are.equal(2, res.ec)
 		end)
 
-		it("encodes the full standard alphanumeric 45-character symbol set", function()
+		-- Table 5 ("Alphanumeric mode character set") lists exactly 45 valid characters.
+		-- Table 7 ("Data capacity") specifies Version 1-L holds a maximum of 25 Alphanumeric characters.
+		it("encodes the full 45-character alphanumeric set, promoting cleanly to Version 2-L", function()
 			local alnum_set = "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ $%*+-./:"
 			local ok, _, size = qrencode.qrcode(alnum_set, 1)
 			assert.is_true(ok)
-			assert.are.equal(25, size) -- 45 alphanumeric characters bump cleanly to Version 2-L
+			assert.are.equal(25, size) -- Version 2 is 25x25 modules
 		end)
 	end)
 
+	-- The triplet/remainder bit-width rules exercised here (10-bit triplets,
+	-- 7-bit two-digit remainder, 4-bit one-digit remainder) are the same
+	-- rules worked in Annex I.2 Step 1 ("012 -> 0000001100" [10-bit],
+	-- "67 -> 1000011" [7-bit]) - these boundary cases follow directly from
+	-- that same procedure, not a separately cited example.
 	describe("numeric remainder bit-packing boundaries", function()
 		local boundary_strings = {
 			{ str = "7",    desc = "1 digit (4-bit remainder)" },
@@ -194,6 +235,11 @@ describe("QRencode module", function()
 		end)
 	end)
 
+	-- Capacity boundaries below are derived from this module's own capacity
+	-- table (get_version_eclevel/capacity), the same constant table used
+	-- across every implementation checked in this file's history (ZXing,
+	-- rxing, the legacy comparison module) - not directly viewed against a
+	-- Table 7 page image.
 	describe("Version 1 capacity boundaries across EC levels (8-bit byte mode)", function()
 		local levels = {
 			{ ec = 1, max_v1 = 17, name = "Level L" },
@@ -217,9 +263,24 @@ describe("QRencode module", function()
 				assert.are.equal(25, size)
 			end)
 		end
+
+        -- Table 7 specifies Version 1-L capacity for Numeric mode is 41 characters.
+		it("saturates Version 1-L numeric capacity at exactly 41 digits", function()
+			local payload_41 = string.rep("9", 41)
+			local ok, _, size = qrencode.qrcode(payload_41, 1)
+			assert.is_true(ok)
+			assert.are.equal(21, size)
+
+			local payload_42 = string.rep("9", 42)
+			local ok2, _, size2 = qrencode.qrcode(payload_42, 1)
+			assert.is_true(ok2)
+			assert.are.equal(25, size2)
+		end)
 	end)
 
-	describe("binary safety and embedded null transparency", function()
+	describe("ISO/IEC 18004:2006 Section 6.4.5 8-bit byte mode compliance", function()
+		-- Section 6.4.5 mandates encoding of the full 8-bit Latin/Kana character set (0x00 to 0xFF).
+		-- These tests verify the implementation's string handling is binary-safe across that range.
 		it("encodes payload containing mixed nulls, control chars, and high bytes", function()
 			local binary_payload = "PREFIX\0\1\2\255\128SUFFIX"
 			local ok, _, size = qrencode.qrcode(binary_payload, 1)
@@ -228,6 +289,8 @@ describe("QRencode module", function()
 		end)
 
 		it("preserves exact Version 1 capacity boundaries when payload consists entirely of null bytes", function()
+			-- Validates against the V1-L 17-byte maximum (Table 7) to ensure
+			-- internal string length checks do not fail on \0 truncation
 			local null_v1 = string.rep("\0", 17)
 			local ok, _, size = qrencode.qrcode(null_v1, 1)
 			assert.is_true(ok)
