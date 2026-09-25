@@ -322,8 +322,10 @@ local generator_polynomial = {
 	[24] = { 21, 227,  96,  87, 232, 117,   0, 111, 218, 228, 226, 192, 152, 169, 180, 159, 126, 251, 117, 211,  48, 135, 121, 229,   0},
 	[26] = { 70, 218, 145, 153, 227,  48, 102,  13, 142, 245,  21, 161,  53, 165,  28, 111, 201, 145,  17, 118, 182, 103,   2, 158, 125, 173,   0},
 	[28] = {123,   9,  37, 242, 119, 212, 195,  42,  87, 245,  43,  21, 201, 232,  27, 205, 147, 195, 190, 110, 180, 108, 234, 224, 104, 200, 223, 168,   0},
-	[30] = {180, 192,  40, 238, 216, 251,  37, 156, 130, 224, 193, 226, 173,  42, 125, 222,  96, 239,  86, 110,  48,  50, 182, 179,  31, 216, 152, 145, 173, 41, 0}}
+	[30] = {180, 192,  40, 238, 216, 251,  37, 156, 130, 224, 193, 226, 173,  42, 125, 222,  96, 239,  86, 110,  48,  50, 182, 179,  31, 216, 152, 145, 173, 41, 0}
+}
 
+--[=[
 local function calculate_error_correction(data, data_offset, len_message, num_ec_codewords, out_array, out_offset)
 	local highest_exponent = len_message + num_ec_codewords - 1
 	for i = 1, len_message do
@@ -339,15 +341,19 @@ local function calculate_error_correction(data, data_offset, len_message, num_ec
 	while highest_exponent >= num_ec_codewords do
 		local exp = int_alpha[mp_int[highest_exponent]]
 		if exp ~= 256 then
-			for j = highest_exponent, highest_exponent - num_ec_codewords, -1 do
-				local gp_val = gp[j - highest_exponent + num_ec_codewords + 1]
-				local combined = (gp_val + exp) % 255
-				mp_int[j] = bxor(alpha_int[combined], mp_int[j])
+            -- Reverted to induction-variable arithmetic to prevent LuaJIT trace desync on large EC blocks
+            for j = highest_exponent, highest_exponent - num_ec_codewords, -1 do
+                local gp_val = gp[j - highest_exponent + num_ec_codewords + 1]
+                local combined = (gp_val + exp) % 255
+                mp_int[j] = bxor(alpha_int[combined], mp_int[j])
 			end
 		end
 		for i = highest_exponent, num_ec_codewords, -1 do
-			if mp_int[i] == 0 then highest_exponent = i - 1
-			else break end
+			if mp_int[i] == 0 then
+				highest_exponent = i - 1
+            else
+                break
+			end
 		end
 		if highest_exponent < num_ec_codewords then break end
 	end
@@ -355,6 +361,52 @@ local function calculate_error_correction(data, data_offset, len_message, num_ec
 	for i = 1, num_ec_codewords do
 		out_array[out_offset + i - 1] = mp_int[num_ec_codewords - i]
 	end
+end
+]=]
+-- This is mathematically the same function as above, but LuaJIT fares better here,
+-- it uses more computations but it is more predictable thus, faster performance
+local function calculate_error_correction(data, data_offset, len_message, num_ec_codewords, out_array, out_offset)
+    -- Clear the shift register (mp_int[0] is x^0, mp_int[num_ec_codewords - 1] is x^(n-1))
+    for i = 0, num_ec_codewords - 1 do
+        mp_int[i] = 0
+    end
+
+    local gp = generator_polynomial[num_ec_codewords]
+    -- Process every single data byte (strict shift register, no skipping zeros)
+    for i = 0, len_message - 1 do
+        local data_byte = data[data_offset + i]
+        -- The MSB of the remainder is at the top of the register
+        local msb = mp_int[num_ec_codewords - 1]
+        local feedback = bxor(msb, data_byte)
+
+        -- Shift the register left (multiply by x)
+        for j = num_ec_codewords - 1, 1, -1 do
+            mp_int[j] = mp_int[j - 1]
+        end
+        mp_int[0] = 0
+
+        -- Subtract (XOR) the generator polynomial if feedback is non-zero
+        if feedback ~= 0 then
+            local exp = int_alpha[feedback]
+            for j = 0, num_ec_codewords - 1 do
+                -- gp[j+1] holds the exponent for x^j
+                local gp_val = gp[j + 1]
+                local combined = gp_val + exp
+
+                -- Explicit Galois wrap to match C bounds
+                if combined >= 255 then
+                    combined = combined - 255
+                end
+
+                mp_int[j] = bxor(mp_int[j], alpha_int[combined])
+            end
+        end
+    end
+    -- Flush the final remainder to the output buffer
+    -- out_array[0] gets the MSB (x^(n-1)), out_array[n-1] gets the LSB (x^0)
+    for i = 0, num_ec_codewords - 1 do
+        out_array[out_offset + i] = mp_int[num_ec_codewords - 1 - i]
+    end
 end
 
 local ecblocks = {
@@ -605,7 +657,16 @@ local function popcount32(x)
 	x = x - band(rshift(x, 1), 0x55555555)
 	x = band(x, 0x33333333) + band(rshift(x, 2), 0x33333333)
 	x = band(x + rshift(x, 4), 0x0F0F0F0F)
-	return band(x, 0xFF) + band(rshift(x, 8), 0xFF) + band(rshift(x, 16), 0xFF) + rshift(x, 24)
+
+    -- Cascade the byte sums:
+    -- Byte 0 gets Byte 0 + Byte 1, Byte 2 gets Byte 2 + Byte 3
+    x = x + rshift(x, 8)
+    -- Byte 0 gets (Byte 0 + Byte 1) + (Byte 2 + Byte 3)
+    x = x + rshift(x, 16)
+
+    -- The maximum possible popcount is 32, which fits in 6 bits.
+    -- A single mask strips away the junk data in the upper bytes.
+    return band(x, 0x3F)
 end
 
 -- SWAR penalty scratch: c_bb holds per-word "differs from left" bits,
