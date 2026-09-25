@@ -155,11 +155,11 @@ local function get_version_eclevel(len,mode,requested_ec_level)
 				digits = tab[3][local_mode]
 			end
 			modebits = bits - digits
-			if local_mode == 1 then
+			if local_mode == 1 then -- numeric
 				c = floor(modebits * 3 / 10)
-			elseif local_mode == 2 then
+			elseif local_mode == 2 then -- alphanumeric
 				c = floor(modebits * 2 / 11)
-			elseif local_mode == 3 then
+			elseif local_mode == 3 then -- binary
 				c = floor(modebits * 1 / 8)
 			else
 				c = floor(modebits * 1 / 13)
@@ -290,7 +290,7 @@ local alpha_int = {
 }
 
 local int_alpha = {
-	[0] = 256,
+	[0] = 256, -- special value
 	0,   1,  25,   2,  50,  26, 198,   3, 223,  51, 238,  27, 104, 199,  75,   4,
 	100, 224,  14,  52, 141, 239, 129,  28, 193, 105, 248, 200,   8,  76, 113,   5,
 	138, 101,  47, 225,  36,  15,  33,  53, 147, 142, 218, 240,  18, 130,  69,  29,
@@ -647,7 +647,7 @@ local maskFunc = {
 	function(_,y) return y%2==0 end,
 	function(x,_) return x%3==0 end,
 	function(x,y) return (y+x)%3==0 end,
-	function(x,y) return (y%4-1.5)*(x%6-2.5)>0 end,
+	function(x,y) return (y%4-1.5)*(x%6-2.5)>0 end, -- optimized for not using math.floor (too slow) or // operation (new Lua only)
 	function(x,y) return (y*x)%2+(y*x)%3==0 end,
 	function(x,y) return ((y*x)%3+y*x)%2==0 end,
 	function(x,y) return ((y*x)%3+y+x)%2==0 end,
@@ -957,7 +957,7 @@ local function build_static(version, size, stride, padding, total_words)
 			y = y + y_dir
 			if y < 1 or y > size then
 				x = x - 2
-				if x == 7 then x = 6 end
+				if x == 7 then x = 6 end -- jump over timing pattern
 				y = y_dir == -1 and 1 or size
 				y_dir = -y_dir
 			end
