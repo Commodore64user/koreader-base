@@ -302,4 +302,29 @@ describe("QRencode module", function()
 			assert.are.equal(25, size2)
 		end)
 	end)
+
+    describe("structural invariants (ISO/IEC 18004:2006 section 6.7)", function()
+        local function cell(matrix, size, x, y) return matrix[(y - 1) * size + x] end
+
+        it("places the dark module at (9, version*4+10) for every version tested", function()
+            for _, version in ipairs({ 1, 5, 10, 20, 40 }) do
+                local payload = string.rep("a", version == 1 and 5 or version * 15)
+                local ok, matrix, size = qrencode.qrcode(payload, 1)
+                assert.is_true(ok)
+                assert.is_true(cell(matrix, size, 9, size - 7) > 0)
+            end
+        end)
+
+        it("keeps the horizontal and vertical timing patterns alternating and unoverwritten", function()
+            local ok, matrix, size = qrencode.qrcode(string.rep("a", 200), 1)
+            assert.is_true(ok)
+            for i = 9, size - 8 do
+                local expect_dark = (i % 2 == 1)
+                assert.are.equal(expect_dark, cell(matrix, size, i, 7) > 0)
+                assert.are.equal(expect_dark, cell(matrix, size, 7, i) > 0)
+            end
+        end)
+    end)
+
+
 end)
