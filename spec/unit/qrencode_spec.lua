@@ -325,6 +325,4 @@ describe("QRencode module", function()
             end
         end)
     end)
-
-
 end)
